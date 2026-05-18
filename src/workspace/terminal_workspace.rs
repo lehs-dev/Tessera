@@ -20,7 +20,7 @@ impl TerminalWorkspace {
 
         let tab_bar = adw::TabBar::builder()
             .view(&tab_view)
-            .autohide(false)
+            .autohide(true)
             .build();
 
         let header_bar = adw::HeaderBar::builder()
