@@ -15,6 +15,9 @@ pub struct TerminalWorkspace {
 impl TerminalWorkspace {
     pub fn new() -> Rc<Self> {
         let tab_view = adw::TabView::builder().build();
+        tab_view.set_hexpand(true);
+        tab_view.set_vexpand(true);
+
         let tab_bar = adw::TabBar::builder()
             .view(&tab_view)
             .autohide(false)
@@ -35,19 +38,27 @@ impl TerminalWorkspace {
             sessions: RefCell::new(HashMap::new()),
         });
 
-        // Handle page detach to clean up sessions
-        let sessions_clone = workspace.sessions.clone();
+        // Handle page detach to clean up sessions.
+        let workspace_weak = Rc::downgrade(&workspace);
         tab_view.connect_page_detached(move |_, page, _| {
+            let Some(workspace) = workspace_weak.upgrade() else {
+                return;
+            };
+
             let child = page.child();
-            let mut session_to_remove = None;
-            for (id, session) in sessions_clone.borrow().iter() {
-                if session.widget().upcast_ref::<gtk::Widget>() == &child {
-                    session_to_remove = Some(*id);
-                    break;
-                }
-            }
+
+            let session_to_remove = {
+                let sessions = workspace.sessions.borrow();
+
+                sessions.iter().find_map(|(id, session)| {
+                    let widget = session.widget().upcast_ref::<gtk::Widget>();
+
+                    if widget == &child { Some(*id) } else { None }
+                })
+            };
+
             if let Some(id) = session_to_remove {
-                sessions_clone.borrow_mut().remove(&id);
+                workspace.sessions.borrow_mut().remove(&id);
             }
         });
 

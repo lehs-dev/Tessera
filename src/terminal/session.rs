@@ -91,15 +91,16 @@ impl TerminalSession {
         let child_exit_status = Rc::clone(&self.child_exit_status);
 
         self.terminal.connect_commit(move |terminal, text, _| {
-            if child_exit_status.get().is_some() && (text.contains('\r') || text.contains('\n')) {
-                if let Err(error) = spawn_default_shell_for(
+            if child_exit_status.get().is_some()
+                && (text.contains('\r') || text.contains('\n'))
+                && let Err(error) = spawn_default_shell_for(
                     terminal,
                     id,
                     Rc::clone(&child_pid),
                     Rc::clone(&child_exit_status),
-                ) {
-                    eprintln!("Failed to restart shell for session {id:?}: {error:#}");
-                }
+                )
+            {
+                eprintln!("Failed to restart shell for session {id:?}: {error:#}");
             }
         });
     }
