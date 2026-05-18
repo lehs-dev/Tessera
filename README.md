@@ -55,3 +55,16 @@ IDE-like command editing.
 - [ ] Command snippets
 - [ ] History search
 - [ ] Export block as Markdown
+
+## Current Status
+
+Sprint 0 completed:
+
+- GTK/libadwaita application boots successfully
+- VTE terminal is embedded
+- Default user shell is spawned from `$SHELL`
+- `TERM=xterm-256color`
+- Basic copy/paste shortcuts
+- Quit shortcut
+
+Next milestone: session model and tabs.

@@ -1,11 +1,28 @@
-use std::env;
+use std::{
+    cell::Cell,
+    env,
+    rc::Rc,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use anyhow::Context;
 use gtk::prelude::*;
 use vte::prelude::*;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TerminalSessionId(u64);
+
+impl TerminalSessionId {
+    pub fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
 pub struct TerminalSession {
+    id: TerminalSessionId,
     terminal: vte::Terminal,
+    child_pid: Rc<Cell<Option<glib::Pid>>>,
+    exit_status: Rc<Cell<Option<i32>>>,
 }
 
 impl TerminalSession {
@@ -20,7 +37,16 @@ impl TerminalSession {
         terminal.set_vexpand(true);
         terminal.set_mouse_autohide(true);
 
-        let session = Self { terminal };
+        let session = Self {
+            id: next_terminal_session_id(),
+            terminal,
+            child_pid: Rc::new(Cell::new(None)),
+            exit_status: Rc::new(Cell::new(None)),
+        };
+
+        session.install_child_exit_handler();
+        session.install_restart_handler();
+
         if let Err(error) = session.spawn_default_shell() {
             eprintln!("Failed to spawn shell: {error:#}");
         }
@@ -28,36 +54,54 @@ impl TerminalSession {
         session
     }
 
+    pub fn id(&self) -> TerminalSessionId {
+        self.id
+    }
+
     pub fn widget(&self) -> &vte::Terminal {
         &self.terminal
     }
 
     fn spawn_default_shell(&self) -> anyhow::Result<()> {
-        let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        let cwd = env::current_dir().context("could not determine working directory")?;
-        let cwd = cwd.to_string_lossy().into_owned();
+        spawn_default_shell_for(
+            &self.terminal,
+            self.id,
+            Rc::clone(&self.child_pid),
+            Rc::clone(&self.exit_status),
+        )
+    }
 
-        let envv = child_environment();
-        let envv_refs = envv.iter().map(String::as_str).collect::<Vec<_>>();
-        let argv = [shell.as_str()];
+    fn install_child_exit_handler(&self) {
+        let id = self.id;
+        let child_pid = Rc::clone(&self.child_pid);
+        let exit_status = Rc::clone(&self.exit_status);
 
-        self.terminal.spawn_async(
-            vte::PtyFlags::DEFAULT,
-            Some(&cwd),
-            &argv,
-            &envv_refs,
-            glib::SpawnFlags::empty(),
-            || {},
-            -1,
-            gio::Cancellable::NONE,
-            |result| {
-                if let Err(error) = result {
-                    eprintln!("Failed to spawn shell: {error}");
+        self.terminal.connect_child_exited(move |terminal, status| {
+            child_pid.set(None);
+            exit_status.set(Some(status));
+
+            terminal.feed(b"\r\nProcess exited. Press Enter to restart.\r\n");
+            eprintln!("Terminal session {id:?} child exited with status {status}");
+        });
+    }
+
+    fn install_restart_handler(&self) {
+        let id = self.id;
+        let child_pid = Rc::clone(&self.child_pid);
+        let exit_status = Rc::clone(&self.exit_status);
+
+        self.terminal.connect_commit(move |terminal, text, _| {
+            if exit_status.get().is_some() && (text.contains('\r') || text.contains('\n')) {
+                if let Err(error) = spawn_default_shell_for(
+                    terminal,
+                    id,
+                    Rc::clone(&child_pid),
+                    Rc::clone(&exit_status),
+                ) {
+                    eprintln!("Failed to restart shell for session {id:?}: {error:#}");
                 }
-            },
-        );
-
-        Ok(())
+            }
+        });
     }
 }
 
@@ -65,6 +109,54 @@ impl Default for TerminalSession {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn next_terminal_session_id() -> TerminalSessionId {
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+    TerminalSessionId(NEXT_ID.fetch_add(1, Ordering::Relaxed))
+}
+
+fn spawn_default_shell_for(
+    terminal: &vte::Terminal,
+    id: TerminalSessionId,
+    child_pid: Rc<Cell<Option<glib::Pid>>>,
+    exit_status: Rc<Cell<Option<i32>>>,
+) -> anyhow::Result<()> {
+    let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let cwd = env::current_dir().context("could not determine working directory")?;
+    let cwd = cwd.to_string_lossy().into_owned();
+
+    let envv = child_environment();
+    let envv_refs = envv.iter().map(String::as_str).collect::<Vec<_>>();
+    let argv = [shell.as_str()];
+
+    child_pid.set(None);
+    exit_status.set(None);
+
+    terminal.spawn_async(
+        vte::PtyFlags::DEFAULT,
+        Some(&cwd),
+        &argv,
+        &envv_refs,
+        glib::SpawnFlags::empty(),
+        || {},
+        -1,
+        gio::Cancellable::NONE,
+        move |result| match result {
+            Ok(pid) => {
+                child_pid.set(Some(pid));
+                exit_status.set(None);
+                eprintln!("Terminal session {id:?} spawned shell with pid {pid:?}");
+            }
+            Err(error) => {
+                child_pid.set(None);
+                eprintln!("Failed to spawn shell for session {id:?}: {error}");
+            }
+        },
+    );
+
+    Ok(())
 }
 
 fn child_environment() -> Vec<String> {
