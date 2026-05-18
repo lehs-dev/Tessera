@@ -59,6 +59,17 @@ impl TerminalSession {
         &self.terminal
     }
 
+    pub fn connect_exited<F>(&self, callback: F)
+    where
+        F: Fn(TerminalSessionId, i32) + 'static,
+    {
+        let id = self.id;
+
+        self.terminal.connect_child_exited(move |_, status| {
+            callback(id, status);
+        });
+    }
+
     fn spawn_default_shell(&self) -> anyhow::Result<()> {
         spawn_default_shell_for(&self.terminal, self.id, Rc::clone(&self.child_pid))
     }

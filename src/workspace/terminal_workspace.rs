@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use adw::prelude::*;
-use vte::prelude::*;
 
 use crate::terminal::{TerminalSession, TerminalSessionId};
 
@@ -90,9 +89,11 @@ impl TerminalWorkspace {
         let page = self.tab_view.append(terminal);
         page.set_title(&subtitle);
 
+        // Workspace reacts to session lifecycle events instead of VTE child signals directly.
+        // This keeps the workspace independent from the current session backend.
         let tab_view_weak = self.tab_view.downgrade();
         let page_weak = page.downgrade();
-        terminal.connect_child_exited(move |_, _| {
+        session.connect_exited(move |_, _| {
             let tab_view = tab_view_weak.clone();
             let page = page_weak.clone();
 
