@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use adw::prelude::*;
+use vte::prelude::*;
 
 use crate::terminal::{TerminalSession, TerminalSessionId};
 
@@ -88,6 +89,21 @@ impl TerminalWorkspace {
 
         let page = self.tab_view.append(terminal);
         page.set_title(&subtitle);
+
+        let tab_view_weak = self.tab_view.downgrade();
+        let page_weak = page.downgrade();
+        terminal.connect_child_exited(move |_, _| {
+            let tab_view = tab_view_weak.clone();
+            let page = page_weak.clone();
+
+            glib::idle_add_local_once(move || {
+                let (Some(tab_view), Some(page)) = (tab_view.upgrade(), page.upgrade()) else {
+                    return;
+                };
+
+                tab_view.close_page(&page);
+            });
+        });
 
         self.tab_view.set_selected_page(&page);
         terminal.grab_focus();

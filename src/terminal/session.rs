@@ -22,7 +22,6 @@ pub struct TerminalSession {
     id: TerminalSessionId,
     terminal: vte::Terminal,
     child_pid: Rc<Cell<Option<glib::Pid>>>,
-    child_exit_status: Rc<Cell<Option<i32>>>,
 }
 
 impl TerminalSession {
@@ -41,11 +40,9 @@ impl TerminalSession {
             id: next_terminal_session_id(),
             terminal,
             child_pid: Rc::new(Cell::new(None)),
-            child_exit_status: Rc::new(Cell::new(None)),
         };
 
         session.install_child_exit_handler();
-        session.install_restart_handler();
 
         if let Err(error) = session.spawn_default_shell() {
             eprintln!("Failed to spawn shell: {error:#}");
@@ -63,45 +60,16 @@ impl TerminalSession {
     }
 
     fn spawn_default_shell(&self) -> anyhow::Result<()> {
-        spawn_default_shell_for(
-            &self.terminal,
-            self.id,
-            Rc::clone(&self.child_pid),
-            Rc::clone(&self.child_exit_status),
-        )
+        spawn_default_shell_for(&self.terminal, self.id, Rc::clone(&self.child_pid))
     }
 
     fn install_child_exit_handler(&self) {
         let id = self.id;
         let child_pid = Rc::clone(&self.child_pid);
-        let child_exit_status = Rc::clone(&self.child_exit_status);
 
-        self.terminal.connect_child_exited(move |terminal, status| {
+        self.terminal.connect_child_exited(move |_, status| {
             child_pid.set(None);
-            child_exit_status.set(Some(status));
-
-            terminal.feed(b"\r\nProcess exited. Press Enter to restart.\r\n");
             eprintln!("Terminal session {id:?} child exited with status {status}");
-        });
-    }
-
-    fn install_restart_handler(&self) {
-        let id = self.id;
-        let child_pid = Rc::clone(&self.child_pid);
-        let child_exit_status = Rc::clone(&self.child_exit_status);
-
-        self.terminal.connect_commit(move |terminal, text, _| {
-            if child_exit_status.get().is_some()
-                && (text.contains('\r') || text.contains('\n'))
-                && let Err(error) = spawn_default_shell_for(
-                    terminal,
-                    id,
-                    Rc::clone(&child_pid),
-                    Rc::clone(&child_exit_status),
-                )
-            {
-                eprintln!("Failed to restart shell for session {id:?}: {error:#}");
-            }
         });
     }
 }
@@ -122,7 +90,6 @@ fn spawn_default_shell_for(
     terminal: &vte::Terminal,
     id: TerminalSessionId,
     child_pid: Rc<Cell<Option<glib::Pid>>>,
-    child_exit_status: Rc<Cell<Option<i32>>>,
 ) -> anyhow::Result<()> {
     let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
     let cwd = env::current_dir().context("could not determine working directory")?;
@@ -133,7 +100,6 @@ fn spawn_default_shell_for(
     let argv = [shell.as_str()];
 
     child_pid.set(None);
-    child_exit_status.set(None);
 
     terminal.spawn_async(
         vte::PtyFlags::DEFAULT,
@@ -147,7 +113,6 @@ fn spawn_default_shell_for(
         move |result| match result {
             Ok(pid) => {
                 child_pid.set(Some(pid));
-                child_exit_status.set(None);
                 eprintln!("Terminal session {id:?} spawned shell with pid {pid:?}");
             }
             Err(error) => {
