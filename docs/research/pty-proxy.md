@@ -19,7 +19,31 @@ user shell
 - The proxy forwards the original terminal output to VTE unchanged.
 - The proxy sends semantic events back to Tessera through a future IPC channel.
 
-Do not implement this proxy in the current milestone.
+The current proxy remains a standalone spike. It is not integrated into the
+GUI `TerminalSession` path.
+
+## Event Channel Spike
+
+`tessera-pty-proxy` now supports a dedicated semantic event output channel:
+
+```text
+TESSERA_EVENT_FD=<fd>
+```
+
+When `TESSERA_EVENT_FD` is set, OSC 133 semantic events are written as JSONL to
+that file descriptor. Forwarded terminal output still goes only to stdout and is
+not mixed with the event protocol.
+
+When `TESSERA_EVENT_FD` is not set, the proxy logs semantic events to stderr for
+standalone debugging only. Stderr is not the long-term semantic event channel.
+Future GUI integration should pass `TESSERA_EVENT_FD` or replace it with a Unix
+socket before wiring the proxy into `TerminalSession`.
+
+Manual smoke test:
+
+```bash
+SHELL=/bin/sh cargo run --bin tessera-pty-proxy
+```
 
 ## Risks
 
