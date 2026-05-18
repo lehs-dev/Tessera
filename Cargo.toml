@@ -1,0 +1,13 @@
+[package]
+name = "Tessera"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+
+[dependencies]
+gtk = { package = "gtk4", version = "0.10" }
+adw = { package = "libadwaita", version = "0.9" }
+vte = { package = "vte4", version = "0.10" }
+gio = "0.21"
+glib = "0.21"
+anyhow = "1"
