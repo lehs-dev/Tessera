@@ -15,9 +15,17 @@ pub enum Osc133Event {
 #[derive(Debug, Default)]
 pub struct Osc133Parser {
     buffer: Vec<u8>,
+    parse_extended_markers: bool,
 }
 
 impl Osc133Parser {
+    pub fn with_extended_markers() -> Self {
+        Self {
+            parse_extended_markers: true,
+            ..Self::default()
+        }
+    }
+
     pub fn push(&mut self, bytes: &[u8]) -> Vec<Osc133Event> {
         self.buffer.extend_from_slice(bytes);
         self.enforce_buffer_limit();
@@ -41,7 +49,7 @@ impl Osc133Parser {
             };
 
             let payload = &self.buffer[OSC_INTRODUCER.len()..terminator_index];
-            if let Some(event) = parse_payload(payload) {
+            if let Some(event) = parse_payload(payload, self.parse_extended_markers) {
                 events.push(event);
             }
 
@@ -66,22 +74,31 @@ impl Osc133Parser {
     }
 }
 
-fn parse_payload(payload: &[u8]) -> Option<Osc133Event> {
+fn parse_payload(payload: &[u8], parse_extended_markers: bool) -> Option<Osc133Event> {
     let marker = payload.strip_prefix(b"133;")?;
 
     match marker {
+        _ if parse_extended_markers && marker.starts_with(b"A;") => Some(Osc133Event::PromptStart),
         b"A" => Some(Osc133Event::PromptStart),
+        _ if parse_extended_markers && marker.starts_with(b"B;") => Some(Osc133Event::PromptEnd),
         b"B" => Some(Osc133Event::PromptEnd),
+        _ if parse_extended_markers && marker.starts_with(b"C;") => Some(Osc133Event::CommandStart),
         b"C" => Some(Osc133Event::CommandStart),
         b"D" => Some(Osc133Event::CommandFinished { status: None }),
         _ if marker.starts_with(b"D;") => Some(Osc133Event::CommandFinished {
-            status: parse_status(&marker[2..]),
+            status: parse_status(&marker[2..], parse_extended_markers),
         }),
         _ => None,
     }
 }
 
-fn parse_status(bytes: &[u8]) -> Option<i32> {
+fn parse_status(bytes: &[u8], parse_extended_markers: bool) -> Option<i32> {
+    let bytes = if parse_extended_markers {
+        bytes.split(|byte| *byte == b';').next().unwrap_or(bytes)
+    } else {
+        bytes
+    };
+
     std::str::from_utf8(bytes)
         .ok()
         .and_then(|status| status.parse::<i32>().ok())
@@ -252,6 +269,34 @@ mod tests {
         let mut parser = Osc133Parser::default();
 
         assert!(parser.push(b"\x1b]133;X\x07").is_empty());
+    }
+
+    #[test]
+    fn ignores_extended_markers_by_default() {
+        let mut parser = Osc133Parser::default();
+
+        assert!(parser.push(b"\x1b]133;A;click_events=1\x07").is_empty());
+        assert!(
+            parser
+                .push(b"\x1b]133;C;cmdline_url=echo%20hello\x07")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn parses_extended_markers_when_enabled() {
+        let mut parser = Osc133Parser::with_extended_markers();
+
+        assert_eq!(
+            parser.push(
+                b"\x1b]133;A;click_events=1\x07\x1b]133;C;cmdline_url=echo%20hello\x07\x1b]133;D;7;extra=1\x07"
+            ),
+            vec![
+                Osc133Event::PromptStart,
+                Osc133Event::CommandStart,
+                Osc133Event::CommandFinished { status: Some(7) },
+            ]
+        );
     }
 
     #[test]

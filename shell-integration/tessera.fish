@@ -1,10 +1,21 @@
 # Tessera OSC 133 shell integration prototype for Fish.
 #
-# Source this manually for testing. Tessera does not install or inject it into
-# user shell configuration yet. This expects Fish versions with fish_prompt,
-# fish_preexec, and fish_postexec events.
+# Tessera sources this only when TESSERA_ENABLE_SHELL_INTEGRATION=1 is set for
+# the proxy backend. It is intentionally additive: it does not initialize
+# Starship, override fish_prompt, or modify persistent shell configuration.
 
+if set -q __TESSERA_FISH_INTEGRATION
+    return 0
+end
 set -g __TESSERA_FISH_INTEGRATION 1
+
+function __tessera_fish_has_native_osc133
+    status test-feature mark-prompt >/dev/null 2>/dev/null
+end
+
+if __tessera_fish_has_native_osc133
+    return 0
+end
 
 function __tessera_osc133
     printf '\033]133;%s\007' $argv[1]
