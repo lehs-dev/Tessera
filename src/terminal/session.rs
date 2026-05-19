@@ -78,7 +78,9 @@ pub struct TerminalSessionSnapshot {
     pub command_count: u64,
     pub last_exit_status: Option<i32>,
     pub current_block_id: Option<CommandBlockId>,
+    pub current_block_command: Option<String>,
     pub last_finished_block_duration: Option<Duration>,
+    pub last_finished_block_command: Option<String>,
 }
 
 type StateChangedCallback = Box<dyn Fn(TerminalSessionSnapshot) + 'static>;
@@ -155,7 +157,10 @@ impl TerminalSession {
             command_count: self.command_count.get(),
             last_exit_status: self.last_exit_status.get(),
             current_block_id: self.current_block_id.get(),
+            current_block_command: current_block_command(blocks, self.current_block_id.get()),
             last_finished_block_duration: last_finished_block_duration(blocks),
+            last_finished_block_command: last_finished_block(blocks)
+                .and_then(|block| block.command.clone()),
         }
     }
 
@@ -330,8 +335,8 @@ impl TerminalSession {
                 last_exit_status.set(command_snapshot.last_exit_status);
                 command_count.set(command_snapshot.command_count);
 
-                match event {
-                    ShellSemanticEvent::CommandStart => {
+                match &event {
+                    ShellSemanticEvent::CommandStart { command } => {
                         let mut blocks = blocks.borrow_mut();
                         let mut current = current_block_id.get();
                         let mut next = next_block_id.get();
@@ -341,6 +346,7 @@ impl TerminalSession {
                             &mut blocks,
                             &mut current,
                             &mut next,
+                            command.clone(),
                             std::time::SystemTime::now(),
                         );
 
@@ -355,7 +361,7 @@ impl TerminalSession {
                             id,
                             &mut blocks,
                             &mut current,
-                            status,
+                            *status,
                             std::time::SystemTime::now(),
                         );
 
@@ -370,7 +376,15 @@ impl TerminalSession {
                     command_count: command_count.get(),
                     last_exit_status: last_exit_status.get(),
                     current_block_id: current_block_id.get(),
+                    current_block_command: {
+                        let blocks = blocks.borrow();
+                        current_block_command(&blocks, current_block_id.get())
+                    },
                     last_finished_block_duration: last_finished_block_duration(&blocks.borrow()),
+                    last_finished_block_command: {
+                        let blocks = blocks.borrow();
+                        last_finished_block(&blocks).and_then(|block| block.command.clone())
+                    },
                 };
 
                 for callback in state_changed_callbacks.borrow().iter() {
@@ -434,12 +448,24 @@ fn apply_adwaita_terminal_colors(terminal: &vte::Terminal, is_dark: bool) {
     terminal.set_color_background(background);
 }
 
-fn last_finished_block_duration(blocks: &[CommandBlock]) -> Option<Duration> {
+fn current_block_command(
+    blocks: &[CommandBlock],
+    current_block_id: Option<CommandBlockId>,
+) -> Option<String> {
+    let current_block_id = current_block_id?;
+
     blocks
         .iter()
-        .rev()
-        .find(|block| block.ended_at.is_some())
-        .and_then(CommandBlock::duration)
+        .find(|block| block.id == current_block_id)
+        .and_then(|block| block.command.clone())
+}
+
+fn last_finished_block(blocks: &[CommandBlock]) -> Option<&CommandBlock> {
+    blocks.iter().rev().find(|block| block.ended_at.is_some())
+}
+
+fn last_finished_block_duration(blocks: &[CommandBlock]) -> Option<Duration> {
+    last_finished_block(blocks).and_then(CommandBlock::duration)
 }
 
 impl Default for TerminalSession {

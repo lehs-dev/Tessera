@@ -8,7 +8,7 @@ const MAX_BUFFER_LEN: usize = 64 * 1024;
 pub enum Osc133Event {
     PromptStart,
     PromptEnd,
-    CommandStart,
+    CommandStart { command: Option<String> },
     CommandFinished { status: Option<i32> },
 }
 
@@ -82,12 +82,52 @@ fn parse_payload(payload: &[u8], parse_extended_markers: bool) -> Option<Osc133E
         b"A" => Some(Osc133Event::PromptStart),
         _ if parse_extended_markers && marker.starts_with(b"B;") => Some(Osc133Event::PromptEnd),
         b"B" => Some(Osc133Event::PromptEnd),
-        _ if parse_extended_markers && marker.starts_with(b"C;") => Some(Osc133Event::CommandStart),
-        b"C" => Some(Osc133Event::CommandStart),
+        _ if parse_extended_markers && marker.starts_with(b"C;") => {
+            Some(Osc133Event::CommandStart {
+                command: parse_cmdline_url(&marker[2..]),
+            })
+        }
+        b"C" => Some(Osc133Event::CommandStart { command: None }),
         b"D" => Some(Osc133Event::CommandFinished { status: None }),
         _ if marker.starts_with(b"D;") => Some(Osc133Event::CommandFinished {
             status: parse_status(&marker[2..], parse_extended_markers),
         }),
+        _ => None,
+    }
+}
+
+fn parse_cmdline_url(params: &[u8]) -> Option<String> {
+    params
+        .split(|byte| *byte == b';')
+        .find_map(|param| param.strip_prefix(b"cmdline_url="))
+        .and_then(percent_decode_utf8)
+        .filter(|command| !command.is_empty())
+}
+
+fn percent_decode_utf8(bytes: &[u8]) -> Option<String> {
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let high = hex_value(*bytes.get(index + 1)?)?;
+            let low = hex_value(*bytes.get(index + 2)?)?;
+            decoded.push((high << 4) | low);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+
+    String::from_utf8(decoded).ok()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
     }
 }
@@ -155,7 +195,29 @@ mod tests {
 
         assert_eq!(
             parser.push(b"\x1b]133;C\x07"),
-            vec![Osc133Event::CommandStart]
+            vec![Osc133Event::CommandStart { command: None }]
+        );
+    }
+
+    #[test]
+    fn parses_extended_command_start_cmdline_url_when_enabled() {
+        let mut parser = Osc133Parser::with_extended_markers();
+
+        assert_eq!(
+            parser.push(b"\x1b]133;C;cmdline_url=echo%20hello\x07"),
+            vec![Osc133Event::CommandStart {
+                command: Some("echo hello".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn invalid_cmdline_url_encoding_does_not_panic() {
+        let mut parser = Osc133Parser::with_extended_markers();
+
+        assert_eq!(
+            parser.push(b"\x1b]133;C;cmdline_url=echo%2hello\x07"),
+            vec![Osc133Event::CommandStart { command: None }]
         );
     }
 
@@ -195,7 +257,10 @@ mod tests {
 
         assert!(parser.push(b"\x1b]133").is_empty());
 
-        assert_eq!(parser.push(b";C\x07"), vec![Osc133Event::CommandStart]);
+        assert_eq!(
+            parser.push(b";C\x07"),
+            vec![Osc133Event::CommandStart { command: None }]
+        );
     }
 
     #[test]
@@ -229,6 +294,13 @@ mod tests {
     }
 
     #[test]
+    fn does_not_parse_cmdline_url_from_plain_output() {
+        let mut parser = Osc133Parser::with_extended_markers();
+
+        assert!(parser.push(b"cmdline_url=echo%20hello\n").is_empty());
+    }
+
+    #[test]
     fn ignores_non_osc133_sequence_before_osc133_sequence_in_same_chunk() {
         let mut parser = Osc133Parser::default();
 
@@ -247,7 +319,7 @@ mod tests {
             vec![
                 Osc133Event::PromptStart,
                 Osc133Event::PromptEnd,
-                Osc133Event::CommandStart,
+                Osc133Event::CommandStart { command: None },
                 Osc133Event::CommandFinished { status: Some(1) },
             ]
         );
@@ -293,7 +365,9 @@ mod tests {
             ),
             vec![
                 Osc133Event::PromptStart,
-                Osc133Event::CommandStart,
+                Osc133Event::CommandStart {
+                    command: Some("echo hello".to_string()),
+                },
                 Osc133Event::CommandFinished { status: Some(7) },
             ]
         );

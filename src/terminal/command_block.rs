@@ -20,6 +20,7 @@ impl CommandBlockId {
 pub struct CommandBlock {
     pub id: CommandBlockId,
     pub session_id: TerminalSessionId,
+    pub command: Option<String>,
     pub started_at: SystemTime,
     pub ended_at: Option<SystemTime>,
     pub exit_status: Option<i32>,
@@ -56,12 +57,13 @@ impl CommandBlockTracker {
         }
     }
 
-    pub fn command_started(&mut self, now: SystemTime) {
+    pub fn command_started(&mut self, command: Option<String>, now: SystemTime) {
         start_command_block(
             self.session_id,
             &mut self.blocks,
             &mut self.current_block_id,
             &mut self.next_block_id,
+            command,
             now,
         );
     }
@@ -94,6 +96,7 @@ pub(crate) fn start_command_block(
     blocks: &mut Vec<CommandBlock>,
     current_block_id: &mut Option<CommandBlockId>,
     next_block_id: &mut u64,
+    command: Option<String>,
     now: SystemTime,
 ) {
     if let Some(open_block_id) = *current_block_id {
@@ -130,6 +133,7 @@ pub(crate) fn start_command_block(
     blocks.push(CommandBlock {
         id,
         session_id,
+        command,
         started_at: now,
         ended_at: None,
         exit_status: None,
@@ -193,12 +197,13 @@ mod tests {
     fn start_command_creates_one_open_block() {
         let mut tracker = CommandBlockTracker::new(session_id());
 
-        tracker.command_started(at(10));
+        tracker.command_started(None, at(10));
 
         let blocks = tracker.blocks();
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].id.as_u64(), 1);
         assert_eq!(blocks[0].session_id, session_id());
+        assert_eq!(blocks[0].command.as_deref(), None);
         assert_eq!(blocks[0].started_at, at(10));
         assert_eq!(blocks[0].ended_at, None);
         assert_eq!(blocks[0].exit_status, None);
@@ -209,7 +214,7 @@ mod tests {
     fn finish_command_closes_block_with_status() {
         let mut tracker = CommandBlockTracker::new(session_id());
 
-        tracker.command_started(at(10));
+        tracker.command_started(None, at(10));
         tracker.command_finished(Some(0), at(13));
 
         let block = &tracker.blocks()[0];
@@ -223,7 +228,7 @@ mod tests {
     fn duration_is_computed() {
         let mut tracker = CommandBlockTracker::new(session_id());
 
-        tracker.command_started(at(10));
+        tracker.command_started(None, at(10));
         tracker.command_finished(Some(0), at(15));
 
         assert_eq!(tracker.blocks()[0].duration(), Some(Duration::from_secs(5)));
@@ -233,18 +238,33 @@ mod tests {
     fn multiple_commands_create_multiple_blocks() {
         let mut tracker = CommandBlockTracker::new(session_id());
 
-        tracker.command_started(at(10));
+        tracker.command_started(Some("echo hello".to_string()), at(10));
         tracker.command_finished(Some(0), at(11));
-        tracker.command_started(at(12));
+        tracker.command_started(Some("false".to_string()), at(12));
         tracker.command_finished(Some(1), at(14));
 
         let blocks = tracker.blocks();
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0].id.as_u64(), 1);
+        assert_eq!(blocks[0].command.as_deref(), Some("echo hello"));
         assert_eq!(blocks[0].exit_status, Some(0));
         assert_eq!(blocks[1].id.as_u64(), 2);
+        assert_eq!(blocks[1].command.as_deref(), Some("false"));
         assert_eq!(blocks[1].exit_status, Some(1));
         assert_eq!(tracker.current_block(), None);
+    }
+
+    #[test]
+    fn command_text_is_stored_on_block_start() {
+        let mut tracker = CommandBlockTracker::new(session_id());
+
+        tracker.command_started(Some("cargo test".to_string()), at(10));
+
+        assert_eq!(tracker.blocks()[0].command.as_deref(), Some("cargo test"));
+        assert_eq!(
+            tracker.current_block().unwrap().command.as_deref(),
+            Some("cargo test")
+        );
     }
 
     #[test]
@@ -261,13 +281,15 @@ mod tests {
     fn start_while_previous_block_open_closes_previous_defensively() {
         let mut tracker = CommandBlockTracker::new(session_id());
 
-        tracker.command_started(at(10));
-        tracker.command_started(at(12));
+        tracker.command_started(Some("sleep 1".to_string()), at(10));
+        tracker.command_started(Some("echo next".to_string()), at(12));
 
         let blocks = tracker.blocks();
         assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].command.as_deref(), Some("sleep 1"));
         assert_eq!(blocks[0].ended_at, Some(at(12)));
         assert_eq!(blocks[0].exit_status, None);
+        assert_eq!(blocks[1].command.as_deref(), Some("echo next"));
         assert_eq!(blocks[1].ended_at, None);
         assert_eq!(tracker.current_block(), Some(&blocks[1]));
     }

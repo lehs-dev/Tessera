@@ -9,8 +9,13 @@ use super::osc133::Osc133Event;
 pub enum ShellSemanticEvent {
     PromptStart,
     PromptEnd,
-    CommandStart,
-    CommandFinished { status: Option<i32> },
+    CommandStart {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command: Option<String>,
+    },
+    CommandFinished {
+        status: Option<i32>,
+    },
 }
 
 impl ShellSemanticEvent {
@@ -32,7 +37,7 @@ impl From<Osc133Event> for ShellSemanticEvent {
         match event {
             Osc133Event::PromptStart => Self::PromptStart,
             Osc133Event::PromptEnd => Self::PromptEnd,
-            Osc133Event::CommandStart => Self::CommandStart,
+            Osc133Event::CommandStart { command } => Self::CommandStart { command },
             Osc133Event::CommandFinished { status } => Self::CommandFinished { status },
         }
     }
@@ -61,6 +66,36 @@ mod tests {
     }
 
     #[test]
+    fn serializes_command_start_without_command() {
+        assert_eq!(
+            ShellSemanticEvent::CommandStart { command: None }
+                .to_json_line()
+                .unwrap(),
+            "{\"event\":\"command_start\"}\n"
+        );
+    }
+
+    #[test]
+    fn serializes_command_start_with_command() {
+        assert_eq!(
+            ShellSemanticEvent::CommandStart {
+                command: Some("echo hello".to_string()),
+            }
+            .to_json_line()
+            .unwrap(),
+            "{\"event\":\"command_start\",\"command\":\"echo hello\"}\n"
+        );
+    }
+
+    #[test]
+    fn deserializes_legacy_command_start_without_command() {
+        assert_eq!(
+            serde_json::from_str::<ShellSemanticEvent>("{\"event\":\"command_start\"}").unwrap(),
+            ShellSemanticEvent::CommandStart { command: None }
+        );
+    }
+
+    #[test]
     fn serializes_command_finished_without_status() {
         assert_eq!(
             ShellSemanticEvent::CommandFinished { status: None }
@@ -81,8 +116,12 @@ mod tests {
             ShellSemanticEvent::PromptEnd
         );
         assert_eq!(
-            ShellSemanticEvent::from(Osc133Event::CommandStart),
-            ShellSemanticEvent::CommandStart
+            ShellSemanticEvent::from(Osc133Event::CommandStart {
+                command: Some("echo hello".to_string()),
+            }),
+            ShellSemanticEvent::CommandStart {
+                command: Some("echo hello".to_string()),
+            }
         );
         assert_eq!(
             ShellSemanticEvent::from(Osc133Event::CommandFinished { status: Some(7) }),

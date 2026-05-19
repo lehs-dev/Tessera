@@ -55,7 +55,7 @@ pub(crate) fn apply_semantic_event(
         ShellSemanticEvent::PromptEnd => {
             snapshot.state = CommandLifecycleState::Input;
         }
-        ShellSemanticEvent::CommandStart => {
+        ShellSemanticEvent::CommandStart { .. } => {
             snapshot.state = CommandLifecycleState::Running;
         }
         ShellSemanticEvent::CommandFinished { status } => {
@@ -99,7 +99,8 @@ mod tests {
     fn command_start_transitions_to_running() {
         let mut tracker = CommandStateTracker::default();
 
-        let snapshot = tracker.apply_semantic_event(&ShellSemanticEvent::CommandStart);
+        let snapshot =
+            tracker.apply_semantic_event(&ShellSemanticEvent::CommandStart { command: None });
 
         assert_eq!(snapshot.state, CommandLifecycleState::Running);
         assert_eq!(snapshot.last_exit_status, None);
@@ -137,7 +138,7 @@ mod tests {
         for status in [Some(0), Some(2), None] {
             tracker.apply_semantic_event(&ShellSemanticEvent::PromptStart);
             tracker.apply_semantic_event(&ShellSemanticEvent::PromptEnd);
-            tracker.apply_semantic_event(&ShellSemanticEvent::CommandStart);
+            tracker.apply_semantic_event(&ShellSemanticEvent::CommandStart { command: None });
             tracker.apply_semantic_event(&ShellSemanticEvent::CommandFinished { status });
         }
 

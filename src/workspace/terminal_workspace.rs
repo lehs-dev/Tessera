@@ -9,6 +9,8 @@ use crate::terminal::{
     CommandLifecycleState, TerminalSession, TerminalSessionId, TerminalSessionSnapshot,
 };
 
+const COMMAND_DISPLAY_MAX_CHARS: usize = 48;
+
 pub struct TerminalWorkspace {
     toolbar_view: adw::ToolbarView,
     tab_view: adw::TabView,
@@ -262,10 +264,19 @@ fn format_session_title(snapshot: &TerminalSessionSnapshot) -> String {
     let session = format!("Session {}", snapshot.session_id.as_u64());
 
     match snapshot.state {
-        CommandLifecycleState::Running => match snapshot.current_block_id {
-            Some(block_id) => format!("{session} · Running · #{}", block_id.as_u64()),
-            None => format!("{session} · Running"),
-        },
+        CommandLifecycleState::Running => {
+            let mut parts = vec![session, "Running".to_string()];
+
+            if let Some(block_id) = snapshot.current_block_id {
+                parts.push(format!("#{}", block_id.as_u64()));
+            }
+
+            if let Some(command) = command_for_display(snapshot.current_block_command.as_deref()) {
+                parts.push(command);
+            }
+
+            parts.join(" · ")
+        }
         CommandLifecycleState::Finished => format_finished_session_title(snapshot),
         CommandLifecycleState::Idle
         | CommandLifecycleState::Prompt
@@ -299,7 +310,32 @@ fn format_finished_session_title(snapshot: &TerminalSessionSnapshot) -> String {
         parts.push(format!("#{}", snapshot.command_count));
     }
 
+    if let Some(command) = command_for_display(snapshot.last_finished_block_command.as_deref()) {
+        parts.push(command);
+    }
+
     parts.join(" · ")
+}
+
+fn command_for_display(command: Option<&str>) -> Option<String> {
+    let command = command?.trim();
+
+    if command.is_empty() {
+        return None;
+    }
+
+    Some(truncate_command_for_display(command))
+}
+
+fn truncate_command_for_display(command: &str) -> String {
+    if command.chars().count() <= COMMAND_DISPLAY_MAX_CHARS {
+        return command.to_string();
+    }
+
+    let visible_chars = COMMAND_DISPLAY_MAX_CHARS.saturating_sub(3);
+    let mut display = command.chars().take(visible_chars).collect::<String>();
+    display.push_str("...");
+    display
 }
 
 fn format_duration(duration: Duration) -> String {
@@ -345,7 +381,9 @@ mod tests {
             command_count: 0,
             last_exit_status: None,
             current_block_id: None,
+            current_block_command: None,
             last_finished_block_duration: None,
+            last_finished_block_command: None,
         }
     }
 
@@ -367,15 +405,29 @@ mod tests {
     }
 
     #[test]
+    fn formats_running_command_with_command_text() {
+        let mut snapshot = snapshot(CommandLifecycleState::Running);
+        snapshot.command_count = 11;
+        snapshot.current_block_id = Some(CommandBlockId::for_tests(12));
+        snapshot.current_block_command = Some("echo hello".to_string());
+
+        assert_eq!(
+            format_session_title(&snapshot),
+            "Session 3 · Running · #12 · echo hello"
+        );
+    }
+
+    #[test]
     fn formats_finished_command_with_exit_zero() {
         let mut snapshot = snapshot(CommandLifecycleState::Finished);
         snapshot.command_count = 12;
         snapshot.last_exit_status = Some(0);
         snapshot.last_finished_block_duration = Some(Duration::from_millis(84));
+        snapshot.last_finished_block_command = Some("echo hello".to_string());
 
         assert_eq!(
             format_session_title(&snapshot),
-            "Session 3 · exit 0 · 84ms · #12"
+            "Session 3 · exit 0 · 84ms · #12 · echo hello"
         );
     }
 
@@ -389,6 +441,32 @@ mod tests {
         assert_eq!(
             format_session_title(&snapshot),
             "Session 3 · exit 1 · 84ms · #12"
+        );
+    }
+
+    #[test]
+    fn long_command_is_truncated_in_display() {
+        let mut snapshot = snapshot(CommandLifecycleState::Running);
+        snapshot.current_block_id = Some(CommandBlockId::for_tests(12));
+        snapshot.current_block_command =
+            Some("printf 'this is a deliberately long command that keeps going'".to_string());
+
+        assert_eq!(
+            format_session_title(&snapshot),
+            "Session 3 · Running · #12 · printf 'this is a deliberately long command t..."
+        );
+    }
+
+    #[test]
+    fn missing_command_does_not_break_formatting() {
+        let mut snapshot = snapshot(CommandLifecycleState::Finished);
+        snapshot.command_count = 12;
+        snapshot.last_exit_status = Some(0);
+        snapshot.last_finished_block_duration = Some(Duration::from_millis(84));
+
+        assert_eq!(
+            format_session_title(&snapshot),
+            "Session 3 · exit 0 · 84ms · #12"
         );
     }
 
