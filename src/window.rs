@@ -12,7 +12,7 @@ pub fn present(app: &adw::Application) {
         .application(app)
         .title("Tessera")
         .default_width(960)
-        .default_height(640)
+        .default_height(980)
         .content(workspace.widget())
         .build();
 
