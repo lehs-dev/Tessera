@@ -6,8 +6,14 @@ use std::{
 };
 
 use anyhow::Context;
-use gtk::prelude::*;
+use gtk::{gdk, prelude::*};
 use vte::prelude::*;
+
+const ADWAITA_LIGHT_BACKGROUND: gdk::RGBA = gdk::RGBA::new(1.0, 1.0, 1.0, 1.0);
+const ADWAITA_LIGHT_FOREGROUND: gdk::RGBA = gdk::RGBA::new(0.0, 0.0, 6.0 / 255.0, 1.0);
+const ADWAITA_DARK_BACKGROUND: gdk::RGBA =
+    gdk::RGBA::new(30.0 / 255.0, 30.0 / 255.0, 30.0 / 255.0, 1.0);
+const ADWAITA_DARK_FOREGROUND: gdk::RGBA = gdk::RGBA::new(1.0, 1.0, 1.0, 1.0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TerminalSessionId(u64);
@@ -20,6 +26,7 @@ impl TerminalSessionId {
 
 pub struct TerminalSession {
     id: TerminalSessionId,
+    _theme_subscription: TerminalThemeSubscription,
     terminal: vte::Terminal,
     child_pid: Rc<Cell<Option<glib::Pid>>>,
 }
@@ -36,8 +43,11 @@ impl TerminalSession {
         terminal.set_vexpand(true);
         terminal.set_mouse_autohide(true);
 
+        let theme_subscription = TerminalThemeSubscription::new(&terminal);
+
         let session = Self {
             id: next_terminal_session_id(),
+            _theme_subscription: theme_subscription,
             terminal,
             child_pid: Rc::new(Cell::new(None)),
         };
@@ -83,6 +93,52 @@ impl TerminalSession {
             eprintln!("Terminal session {id:?} child exited with status {status}");
         });
     }
+}
+
+struct TerminalThemeSubscription {
+    style_manager: adw::StyleManager,
+    handler_id: Option<glib::SignalHandlerId>,
+}
+
+impl TerminalThemeSubscription {
+    fn new(terminal: &vte::Terminal) -> Self {
+        let style_manager = adw::StyleManager::default();
+
+        apply_adwaita_terminal_colors(terminal, style_manager.is_dark());
+
+        let terminal_weak = terminal.downgrade();
+        let handler_id = style_manager.connect_dark_notify(move |style_manager| {
+            let Some(terminal) = terminal_weak.upgrade() else {
+                return;
+            };
+
+            apply_adwaita_terminal_colors(&terminal, style_manager.is_dark());
+        });
+
+        Self {
+            style_manager,
+            handler_id: Some(handler_id),
+        }
+    }
+}
+
+impl Drop for TerminalThemeSubscription {
+    fn drop(&mut self) {
+        if let Some(handler_id) = self.handler_id.take() {
+            self.style_manager.disconnect(handler_id);
+        }
+    }
+}
+
+fn apply_adwaita_terminal_colors(terminal: &vte::Terminal, is_dark: bool) {
+    let (foreground, background) = if is_dark {
+        (&ADWAITA_DARK_FOREGROUND, &ADWAITA_DARK_BACKGROUND)
+    } else {
+        (&ADWAITA_LIGHT_FOREGROUND, &ADWAITA_LIGHT_BACKGROUND)
+    };
+
+    terminal.set_color_foreground(foreground);
+    terminal.set_color_background(background);
 }
 
 impl Default for TerminalSession {
