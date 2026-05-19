@@ -3,11 +3,12 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use adw::prelude::*;
+use vte::prelude::*;
 
 use crate::terminal::{TerminalSession, TerminalSessionId};
 
 pub struct TerminalWorkspace {
-    container: gtk::Box,
+    toolbar_view: adw::ToolbarView,
     tab_view: adw::TabView,
     sessions: RefCell<HashMap<TerminalSessionId, Rc<TerminalSession>>>,
 }
@@ -21,19 +22,28 @@ impl TerminalWorkspace {
         let tab_bar = adw::TabBar::builder()
             .view(&tab_view)
             .autohide(true)
+            .expand_tabs(true)
+            .build();
+
+        let new_tab_btn = gtk::Button::builder()
+            .icon_name("tab-new-symbolic")
+            .tooltip_text("New Tab")
+            .action_name("win.new-tab")
             .build();
 
         let header_bar = adw::HeaderBar::builder()
             .show_end_title_buttons(true)
+            .title_widget(&tab_bar)
             .build();
 
-        let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        container.append(&header_bar);
-        container.append(&tab_bar);
-        container.append(&tab_view);
+        header_bar.pack_end(&new_tab_btn);
+
+        let toolbar_view = adw::ToolbarView::new();
+        toolbar_view.add_top_bar(&header_bar);
+        toolbar_view.set_content(Some(&tab_view));
 
         let workspace = Rc::new(Self {
-            container,
+            toolbar_view,
             tab_view: tab_view.clone(),
             sessions: RefCell::new(HashMap::new()),
         });
@@ -67,8 +77,8 @@ impl TerminalWorkspace {
         workspace
     }
 
-    pub fn widget(&self) -> &gtk::Box {
-        &self.container
+    pub fn widget(&self) -> &adw::ToolbarView {
+        &self.toolbar_view
     }
 
     pub fn tab_view(&self) -> &adw::TabView {
@@ -84,10 +94,21 @@ impl TerminalWorkspace {
             .insert(session_id, Rc::clone(&session));
 
         let terminal = session.widget();
-        let subtitle = format!("Session {}", session_id.as_u64());
 
         let page = self.tab_view.append(terminal);
-        page.set_title(&subtitle);
+        page.set_title("Terminal");
+
+        let page_weak = page.downgrade();
+        terminal.connect_window_title_notify(move |term| {
+            let Some(page) = page_weak.upgrade() else {
+                return;
+            };
+
+            let title = term.window_title().unwrap_or_default();
+            if !title.is_empty() {
+                page.set_title(&title);
+            }
+        });
 
         // Workspace reacts to session lifecycle events instead of VTE child signals directly.
         // This keeps the workspace independent from the current session backend.
