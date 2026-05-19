@@ -1,9 +1,9 @@
 # Tessera
 
-A Linux-native terminal workspace with structured command blocks.
+A Linux-native terminal workspace aiming for structured command blocks.
 
 Tessera is an experimental GTK/libadwaita terminal workspace for Linux desktops.
-It uses VTE as the terminal backend and focuses on developer-oriented command
+It uses VTE as the terminal backend and is exploring developer-oriented command
 workflows: structured command blocks, readable output, command history, and
 IDE-like command editing.
 
@@ -55,3 +55,20 @@ IDE-like command editing.
 - [ ] Command snippets
 - [ ] History search
 - [ ] Export block as Markdown
+
+## Current Status
+
+Tessera currently provides:
+
+- GTK/libadwaita application shell
+- VTE-based terminal sessions
+- Multiple tabs
+- Basic copy/paste shortcuts
+- Session lifecycle handling
+- Experimental OSC 133 parser infrastructure
+
+Next milestones:
+
+- PTY proxy spike
+- Shell semantic event channel
+- Command block metadata model

@@ -1,3 +1,3 @@
 mod session;
 
-pub use session::TerminalSession;
+pub use session::{TerminalSession, TerminalSessionId};
