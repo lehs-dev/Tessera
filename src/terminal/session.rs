@@ -8,6 +8,7 @@ use std::{
     rc::Rc,
     sync::atomic::{AtomicU64, Ordering},
     thread,
+    time::Duration,
 };
 
 use anyhow::{Context, anyhow};
@@ -18,8 +19,8 @@ use tessera::shell_integration::event::ShellSemanticEvent;
 use vte::prelude::*;
 
 use super::command_block::{finish_command_block, start_command_block};
-use super::command_state::apply_semantic_event;
-use super::{CommandBlock, CommandBlockId, CommandLifecycleState, TerminalSessionSnapshot};
+use super::command_state::{CommandStateSnapshot, apply_semantic_event};
+use super::{CommandBlock, CommandBlockId, CommandLifecycleState};
 
 const ADWAITA_LIGHT_BACKGROUND: gdk::RGBA = gdk::RGBA::new(1.0, 1.0, 1.0, 1.0);
 const ADWAITA_LIGHT_FOREGROUND: gdk::RGBA = gdk::RGBA::new(0.0, 0.0, 6.0 / 255.0, 1.0);
@@ -70,6 +71,18 @@ impl TerminalSessionId {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalSessionSnapshot {
+    pub session_id: TerminalSessionId,
+    pub state: CommandLifecycleState,
+    pub command_count: u64,
+    pub last_exit_status: Option<i32>,
+    pub current_block_id: Option<CommandBlockId>,
+    pub last_finished_block_duration: Option<Duration>,
+}
+
+type StateChangedCallback = Box<dyn Fn(TerminalSessionSnapshot) + 'static>;
+
 pub struct TerminalSession {
     id: TerminalSessionId,
     backend: TerminalBackend,
@@ -82,6 +95,7 @@ pub struct TerminalSession {
     blocks: Rc<RefCell<Vec<CommandBlock>>>,
     current_block_id: Rc<Cell<Option<CommandBlockId>>>,
     next_block_id: Rc<Cell<u64>>,
+    state_changed_callbacks: Rc<RefCell<Vec<StateChangedCallback>>>,
 }
 
 impl TerminalSession {
@@ -110,6 +124,7 @@ impl TerminalSession {
             blocks: Rc::new(RefCell::new(Vec::new())),
             current_block_id: Rc::new(Cell::new(None)),
             next_block_id: Rc::new(Cell::new(1)),
+            state_changed_callbacks: Rc::new(RefCell::new(Vec::new())),
         };
 
         session.install_child_exit_handler();
@@ -129,12 +144,18 @@ impl TerminalSession {
         &self.terminal
     }
 
-    #[allow(dead_code)]
     pub fn snapshot(&self) -> TerminalSessionSnapshot {
+        self.snapshot_from_blocks(&self.blocks.borrow())
+    }
+
+    fn snapshot_from_blocks(&self, blocks: &[CommandBlock]) -> TerminalSessionSnapshot {
         TerminalSessionSnapshot {
+            session_id: self.id,
             state: *self.command_state.borrow(),
-            last_exit_status: self.last_exit_status.get(),
             command_count: self.command_count.get(),
+            last_exit_status: self.last_exit_status.get(),
+            current_block_id: self.current_block_id.get(),
+            last_finished_block_duration: last_finished_block_duration(blocks),
         }
     }
 
@@ -163,6 +184,15 @@ impl TerminalSession {
         self.terminal.connect_child_exited(move |_, status| {
             callback(id, status);
         });
+    }
+
+    pub fn connect_state_changed<F>(&self, callback: F)
+    where
+        F: Fn(TerminalSessionSnapshot) + 'static,
+    {
+        self.state_changed_callbacks
+            .borrow_mut()
+            .push(Box::new(callback));
     }
 
     fn spawn_default_shell(&self) -> anyhow::Result<()> {
@@ -284,20 +314,21 @@ impl TerminalSession {
         let blocks = Rc::clone(&self.blocks);
         let current_block_id = Rc::clone(&self.current_block_id);
         let next_block_id = Rc::clone(&self.next_block_id);
+        let state_changed_callbacks = Rc::clone(&self.state_changed_callbacks);
 
         glib::MainContext::default().spawn_local(async move {
             while let Some(event) = receiver.next().await {
-                let mut snapshot = TerminalSessionSnapshot {
+                let mut command_snapshot = CommandStateSnapshot {
                     state: *command_state.borrow(),
                     last_exit_status: last_exit_status.get(),
                     command_count: command_count.get(),
                 };
 
-                apply_semantic_event(&mut snapshot, &event);
+                apply_semantic_event(&mut command_snapshot, &event);
 
-                *command_state.borrow_mut() = snapshot.state;
-                last_exit_status.set(snapshot.last_exit_status);
-                command_count.set(snapshot.command_count);
+                *command_state.borrow_mut() = command_snapshot.state;
+                last_exit_status.set(command_snapshot.last_exit_status);
+                command_count.set(command_snapshot.command_count);
 
                 match event {
                     ShellSemanticEvent::CommandStart => {
@@ -331,6 +362,19 @@ impl TerminalSession {
                         current_block_id.set(current);
                     }
                     ShellSemanticEvent::PromptStart | ShellSemanticEvent::PromptEnd => {}
+                }
+
+                let snapshot = TerminalSessionSnapshot {
+                    session_id: id,
+                    state: *command_state.borrow(),
+                    command_count: command_count.get(),
+                    last_exit_status: last_exit_status.get(),
+                    current_block_id: current_block_id.get(),
+                    last_finished_block_duration: last_finished_block_duration(&blocks.borrow()),
+                };
+
+                for callback in state_changed_callbacks.borrow().iter() {
+                    callback(snapshot.clone());
                 }
 
                 eprintln!(
@@ -388,6 +432,14 @@ fn apply_adwaita_terminal_colors(terminal: &vte::Terminal, is_dark: bool) {
 
     terminal.set_color_foreground(foreground);
     terminal.set_color_background(background);
+}
+
+fn last_finished_block_duration(blocks: &[CommandBlock]) -> Option<Duration> {
+    blocks
+        .iter()
+        .rev()
+        .find(|block| block.ended_at.is_some())
+        .and_then(CommandBlock::duration)
 }
 
 impl Default for TerminalSession {

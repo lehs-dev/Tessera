@@ -10,13 +10,13 @@ pub enum CommandLifecycleState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TerminalSessionSnapshot {
+pub(crate) struct CommandStateSnapshot {
     pub state: CommandLifecycleState,
     pub last_exit_status: Option<i32>,
     pub command_count: u64,
 }
 
-impl Default for TerminalSessionSnapshot {
+impl Default for CommandStateSnapshot {
     fn default() -> Self {
         Self {
             state: CommandLifecycleState::Idle,
@@ -29,22 +29,25 @@ impl Default for TerminalSessionSnapshot {
 #[cfg(test)]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct CommandStateTracker {
-    snapshot: TerminalSessionSnapshot,
+    snapshot: CommandStateSnapshot,
 }
 
 #[cfg(test)]
 impl CommandStateTracker {
-    fn snapshot(&self) -> TerminalSessionSnapshot {
+    fn snapshot(&self) -> CommandStateSnapshot {
         self.snapshot.clone()
     }
 
-    fn apply_semantic_event(&mut self, event: &ShellSemanticEvent) -> TerminalSessionSnapshot {
+    fn apply_semantic_event(&mut self, event: &ShellSemanticEvent) -> CommandStateSnapshot {
         apply_semantic_event(&mut self.snapshot, event);
         self.snapshot()
     }
 }
 
-pub fn apply_semantic_event(snapshot: &mut TerminalSessionSnapshot, event: &ShellSemanticEvent) {
+pub(crate) fn apply_semantic_event(
+    snapshot: &mut CommandStateSnapshot,
+    event: &ShellSemanticEvent,
+) {
     match event {
         ShellSemanticEvent::PromptStart => {
             snapshot.state = CommandLifecycleState::Prompt;
@@ -66,7 +69,7 @@ pub fn apply_semantic_event(snapshot: &mut TerminalSessionSnapshot, event: &Shel
 #[cfg(test)]
 mod tests {
     use super::{
-        CommandLifecycleState, CommandStateTracker, TerminalSessionSnapshot, apply_semantic_event,
+        CommandLifecycleState, CommandStateSnapshot, CommandStateTracker, apply_semantic_event,
     };
     use tessera::shell_integration::event::ShellSemanticEvent;
 
@@ -140,7 +143,7 @@ mod tests {
 
         assert_eq!(
             tracker.snapshot(),
-            TerminalSessionSnapshot {
+            CommandStateSnapshot {
                 state: CommandLifecycleState::Finished,
                 last_exit_status: None,
                 command_count: 3,
@@ -150,7 +153,7 @@ mod tests {
 
     #[test]
     fn pure_apply_semantic_event_updates_snapshot() {
-        let mut snapshot = TerminalSessionSnapshot::default();
+        let mut snapshot = CommandStateSnapshot::default();
 
         apply_semantic_event(&mut snapshot, &ShellSemanticEvent::PromptStart);
 

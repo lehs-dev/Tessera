@@ -1,11 +1,13 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::time::Duration;
 
 use adw::prelude::*;
-use vte::prelude::*;
 
-use crate::terminal::{TerminalSession, TerminalSessionId};
+use crate::terminal::{
+    CommandLifecycleState, TerminalSession, TerminalSessionId, TerminalSessionSnapshot,
+};
 
 pub struct TerminalWorkspace {
     toolbar_view: adw::ToolbarView,
@@ -152,34 +154,26 @@ impl TerminalWorkspace {
         let terminal = session.widget();
 
         let page = self.tab_view.append(terminal);
-        page.set_title("Terminal");
+        apply_session_snapshot_to_page(
+            &session.snapshot(),
+            &page,
+            &self.tab_view,
+            &self.window_title,
+        );
 
         let page_weak = page.downgrade();
         let tab_view_weak = self.tab_view.downgrade();
         let window_title_weak = self.window_title.downgrade();
-        terminal.connect_window_title_notify(move |term| {
-            let Some(page) = page_weak.upgrade() else {
+        session.connect_state_changed(move |snapshot| {
+            let (Some(page), Some(tab_view), Some(window_title)) = (
+                page_weak.upgrade(),
+                tab_view_weak.upgrade(),
+                window_title_weak.upgrade(),
+            ) else {
                 return;
             };
 
-            let title = term.window_title().unwrap_or_default();
-            if !title.is_empty() {
-                page.set_title(&title);
-
-                let Some(tab_view) = tab_view_weak.upgrade() else {
-                    return;
-                };
-                let Some(window_title) = window_title_weak.upgrade() else {
-                    return;
-                };
-
-                if tab_view
-                    .selected_page()
-                    .is_some_and(|selected_page| selected_page == page)
-                {
-                    window_title.set_title(&title);
-                }
-            }
+            apply_session_snapshot_to_page(&snapshot, &page, &tab_view, &window_title);
         });
 
         // Workspace reacts to session lifecycle events instead of VTE child signals directly.
@@ -244,10 +238,164 @@ fn update_window_title(tab_view: &adw::TabView, window_title: &adw::WindowTitle)
     window_title.set_title(&title);
 }
 
+fn apply_session_snapshot_to_page(
+    snapshot: &TerminalSessionSnapshot,
+    page: &adw::TabPage,
+    tab_view: &adw::TabView,
+    window_title: &adw::WindowTitle,
+) {
+    let title = format_session_title(snapshot);
+
+    page.set_title(&title);
+    page.set_tooltip(&title);
+
+    if tab_view
+        .selected_page()
+        .as_ref()
+        .is_some_and(|selected_page| selected_page == page)
+    {
+        window_title.set_title(&title);
+    }
+}
+
+fn format_session_title(snapshot: &TerminalSessionSnapshot) -> String {
+    let session = format!("Session {}", snapshot.session_id.as_u64());
+
+    match snapshot.state {
+        CommandLifecycleState::Running => match snapshot.current_block_id {
+            Some(block_id) => format!("{session} · Running · #{}", block_id.as_u64()),
+            None => format!("{session} · Running"),
+        },
+        CommandLifecycleState::Finished => format_finished_session_title(snapshot),
+        CommandLifecycleState::Idle
+        | CommandLifecycleState::Prompt
+        | CommandLifecycleState::Input => {
+            if snapshot.command_count > 0
+                && (snapshot.last_exit_status.is_some()
+                    || snapshot.last_finished_block_duration.is_some())
+            {
+                format_finished_session_title(snapshot)
+            } else {
+                format!("{session} · Idle")
+            }
+        }
+    }
+}
+
+fn format_finished_session_title(snapshot: &TerminalSessionSnapshot) -> String {
+    let mut parts = vec![
+        format!("Session {}", snapshot.session_id.as_u64()),
+        match snapshot.last_exit_status {
+            Some(status) => format!("exit {status}"),
+            None => "exit ?".to_string(),
+        },
+    ];
+
+    if let Some(duration) = snapshot.last_finished_block_duration {
+        parts.push(format_duration(duration));
+    }
+
+    if snapshot.command_count > 0 {
+        parts.push(format!("#{}", snapshot.command_count));
+    }
+
+    parts.join(" · ")
+}
+
+fn format_duration(duration: Duration) -> String {
+    if duration.as_millis() < 1_000 {
+        return format!("{}ms", duration.as_millis());
+    }
+
+    let seconds = duration.as_secs_f64();
+    if seconds < 10.0 {
+        let mut formatted = format!("{seconds:.1}");
+        if formatted.ends_with(".0") {
+            formatted.truncate(formatted.len() - 2);
+        }
+
+        return format!("{formatted}s");
+    }
+
+    format!("{}s", duration.as_secs())
+}
+
 fn new_tab_button() -> gtk::Button {
     gtk::Button::builder()
         .icon_name("tab-new-symbolic")
         .tooltip_text("New Tab")
         .action_name("win.new-tab")
         .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use crate::terminal::{
+        CommandBlockId, CommandLifecycleState, TerminalSessionId, TerminalSessionSnapshot,
+    };
+
+    use super::{format_duration, format_session_title};
+
+    fn snapshot(state: CommandLifecycleState) -> TerminalSessionSnapshot {
+        TerminalSessionSnapshot {
+            session_id: TerminalSessionId::for_tests(3),
+            state,
+            command_count: 0,
+            last_exit_status: None,
+            current_block_id: None,
+            last_finished_block_duration: None,
+        }
+    }
+
+    #[test]
+    fn formats_idle_session() {
+        assert_eq!(
+            format_session_title(&snapshot(CommandLifecycleState::Idle)),
+            "Session 3 · Idle"
+        );
+    }
+
+    #[test]
+    fn formats_running_command() {
+        let mut snapshot = snapshot(CommandLifecycleState::Running);
+        snapshot.command_count = 11;
+        snapshot.current_block_id = Some(CommandBlockId::for_tests(12));
+
+        assert_eq!(format_session_title(&snapshot), "Session 3 · Running · #12");
+    }
+
+    #[test]
+    fn formats_finished_command_with_exit_zero() {
+        let mut snapshot = snapshot(CommandLifecycleState::Finished);
+        snapshot.command_count = 12;
+        snapshot.last_exit_status = Some(0);
+        snapshot.last_finished_block_duration = Some(Duration::from_millis(84));
+
+        assert_eq!(
+            format_session_title(&snapshot),
+            "Session 3 · exit 0 · 84ms · #12"
+        );
+    }
+
+    #[test]
+    fn formats_finished_command_with_exit_one() {
+        let mut snapshot = snapshot(CommandLifecycleState::Finished);
+        snapshot.command_count = 12;
+        snapshot.last_exit_status = Some(1);
+        snapshot.last_finished_block_duration = Some(Duration::from_millis(84));
+
+        assert_eq!(
+            format_session_title(&snapshot),
+            "Session 3 · exit 1 · 84ms · #12"
+        );
+    }
+
+    #[test]
+    fn formats_duration() {
+        assert_eq!(format_duration(Duration::from_millis(84)), "84ms");
+        assert_eq!(format_duration(Duration::from_secs(1)), "1s");
+        assert_eq!(format_duration(Duration::from_millis(1_500)), "1.5s");
+    }
 }
