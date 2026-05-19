@@ -1,4 +1,5 @@
 use adw::prelude::*;
+use gtk::gdk;
 
 use crate::window;
 
@@ -9,6 +10,10 @@ pub fn run() {
         .application_id(APPLICATION_ID)
         .build();
 
+    application.connect_startup(|_| {
+        load_css();
+    });
+
     install_app_actions(&application);
 
     application.connect_activate(|app| {
@@ -16,6 +21,26 @@ pub fn run() {
     });
 
     application.run();
+}
+
+fn load_css() {
+    let provider = gtk::CssProvider::new();
+    provider.load_from_data(
+        "
+        tabbar tab {
+            min-width: 140px;
+            max-width: 220px;
+        }
+    ",
+    );
+
+    if let Some(display) = gdk::Display::default() {
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    }
 }
 
 fn install_app_actions(application: &adw::Application) {
