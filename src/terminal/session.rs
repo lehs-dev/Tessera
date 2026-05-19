@@ -17,8 +17,9 @@ use gtk::{gdk, prelude::*};
 use tessera::shell_integration::event::ShellSemanticEvent;
 use vte::prelude::*;
 
+use super::command_block::{finish_command_block, start_command_block};
 use super::command_state::apply_semantic_event;
-use super::{CommandLifecycleState, TerminalSessionSnapshot};
+use super::{CommandBlock, CommandBlockId, CommandLifecycleState, TerminalSessionSnapshot};
 
 const ADWAITA_LIGHT_BACKGROUND: gdk::RGBA = gdk::RGBA::new(1.0, 1.0, 1.0, 1.0);
 const ADWAITA_LIGHT_FOREGROUND: gdk::RGBA = gdk::RGBA::new(0.0, 0.0, 6.0 / 255.0, 1.0);
@@ -62,6 +63,11 @@ impl TerminalSessionId {
     pub fn as_u64(self) -> u64 {
         self.0
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests(value: u64) -> Self {
+        Self(value)
+    }
 }
 
 pub struct TerminalSession {
@@ -73,6 +79,9 @@ pub struct TerminalSession {
     command_state: Rc<RefCell<CommandLifecycleState>>,
     last_exit_status: Rc<Cell<Option<i32>>>,
     command_count: Rc<Cell<u64>>,
+    blocks: Rc<RefCell<Vec<CommandBlock>>>,
+    current_block_id: Rc<Cell<Option<CommandBlockId>>>,
+    next_block_id: Rc<Cell<u64>>,
 }
 
 impl TerminalSession {
@@ -98,6 +107,9 @@ impl TerminalSession {
             command_state: Rc::new(RefCell::new(CommandLifecycleState::Idle)),
             last_exit_status: Rc::new(Cell::new(None)),
             command_count: Rc::new(Cell::new(0)),
+            blocks: Rc::new(RefCell::new(Vec::new())),
+            current_block_id: Rc::new(Cell::new(None)),
+            next_block_id: Rc::new(Cell::new(1)),
         };
 
         session.install_child_exit_handler();
@@ -124,6 +136,22 @@ impl TerminalSession {
             last_exit_status: self.last_exit_status.get(),
             command_count: self.command_count.get(),
         }
+    }
+
+    #[allow(dead_code)]
+    pub fn blocks_snapshot(&self) -> Vec<CommandBlock> {
+        self.blocks.borrow().clone()
+    }
+
+    #[allow(dead_code)]
+    pub fn current_block(&self) -> Option<CommandBlock> {
+        let current_block_id = self.current_block_id.get()?;
+
+        self.blocks
+            .borrow()
+            .iter()
+            .find(|block| block.id == current_block_id)
+            .cloned()
     }
 
     pub fn connect_exited<F>(&self, callback: F)
@@ -253,6 +281,9 @@ impl TerminalSession {
         let command_state = Rc::clone(&self.command_state);
         let last_exit_status = Rc::clone(&self.last_exit_status);
         let command_count = Rc::clone(&self.command_count);
+        let blocks = Rc::clone(&self.blocks);
+        let current_block_id = Rc::clone(&self.current_block_id);
+        let next_block_id = Rc::clone(&self.next_block_id);
 
         glib::MainContext::default().spawn_local(async move {
             while let Some(event) = receiver.next().await {
@@ -267,6 +298,40 @@ impl TerminalSession {
                 *command_state.borrow_mut() = snapshot.state;
                 last_exit_status.set(snapshot.last_exit_status);
                 command_count.set(snapshot.command_count);
+
+                match event {
+                    ShellSemanticEvent::CommandStart => {
+                        let mut blocks = blocks.borrow_mut();
+                        let mut current = current_block_id.get();
+                        let mut next = next_block_id.get();
+
+                        start_command_block(
+                            id,
+                            &mut blocks,
+                            &mut current,
+                            &mut next,
+                            std::time::SystemTime::now(),
+                        );
+
+                        current_block_id.set(current);
+                        next_block_id.set(next);
+                    }
+                    ShellSemanticEvent::CommandFinished { status } => {
+                        let mut blocks = blocks.borrow_mut();
+                        let mut current = current_block_id.get();
+
+                        finish_command_block(
+                            id,
+                            &mut blocks,
+                            &mut current,
+                            status,
+                            std::time::SystemTime::now(),
+                        );
+
+                        current_block_id.set(current);
+                    }
+                    ShellSemanticEvent::PromptStart | ShellSemanticEvent::PromptEnd => {}
+                }
 
                 eprintln!(
                     "Terminal session {id:?} semantic event: {event:?}, state: {:?}, command_count: {}",
