@@ -10,6 +10,8 @@ use gtk::{gdk, pango};
 use crate::terminal::{
     CommandBlock, CommandInputAvailability, CommandLifecycleState, TerminalSession,
     TerminalSessionId, TerminalSessionSnapshot, command_input_availability,
+    format_command_block_duration, format_command_block_markdown, format_command_block_output_size,
+    format_command_blocks_markdown_table,
 };
 
 const COMMAND_DISPLAY_MAX_CHARS: usize = 48;
@@ -389,21 +391,7 @@ fn truncate_text_for_display(command: &str, max_chars: usize) -> String {
 }
 
 fn format_duration(duration: Duration) -> String {
-    if duration.as_millis() < 1_000 {
-        return format!("{}ms", duration.as_millis());
-    }
-
-    let seconds = duration.as_secs_f64();
-    if seconds < 10.0 {
-        let mut formatted = format!("{seconds:.1}");
-        if formatted.ends_with(".0") {
-            formatted.truncate(formatted.len() - 2);
-        }
-
-        return format!("{formatted}s");
-    }
-
-    format!("{}s", duration.as_secs())
+    format_command_block_duration(duration)
 }
 
 fn new_tab_button() -> gtk::Button {
@@ -445,6 +433,15 @@ fn recent_blocks_content(
 
         return content.upcast();
     }
+
+    let copy_recent_button = gtk::Button::builder()
+        .label("Copy Recent Blocks Markdown")
+        .tooltip_text("Copy Recent Blocks Markdown")
+        .halign(gtk::Align::Start)
+        .build();
+    let recent_markdown = format_command_blocks_markdown_table(blocks);
+    copy_recent_button.connect_clicked(move |_| copy_text_to_clipboard(&recent_markdown));
+    content.append(&copy_recent_button);
 
     let list = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::None)
@@ -490,6 +487,15 @@ fn recent_block_row(
         .build();
     row_box.append(&label);
 
+    let copy_block_markdown_button = gtk::Button::builder()
+        .label("Copy Block Markdown")
+        .tooltip_text("Copy Block Markdown")
+        .valign(gtk::Align::Center)
+        .build();
+    let block_markdown = format_command_block_markdown(block);
+    copy_block_markdown_button.connect_clicked(move |_| copy_text_to_clipboard(&block_markdown));
+    row_box.append(&copy_block_markdown_button);
+
     if let Some(command) = command_text_for_actions(block) {
         let availability = command_input_availability(Some(command), state);
 
@@ -500,7 +506,7 @@ fn recent_block_row(
             .build();
         let command = command.to_string();
         let copy_command = command.clone();
-        copy_button.connect_clicked(move |_| copy_command_to_clipboard(&copy_command));
+        copy_button.connect_clicked(move |_| copy_text_to_clipboard(&copy_command));
         row_box.append(&copy_button);
 
         let insert_button = gtk::Button::builder()
@@ -549,6 +555,17 @@ fn format_command_block_row(block: &CommandBlock) -> String {
         parts.push("running".to_string());
     }
 
+    if block.has_output_metadata() {
+        parts.push(format!(
+            "output: {}",
+            format_command_block_output_size(block.output_bytes.len())
+        ));
+        parts.push(format!(
+            "output truncated: {}",
+            yes_no(block.output_truncated)
+        ));
+    }
+
     parts.push(command_block_command_for_display(block.command.as_deref()));
 
     parts.join(" · ")
@@ -593,12 +610,16 @@ fn command_run_tooltip(availability: CommandInputAvailability, command: &str) ->
     "Command input is disabled while the session is running"
 }
 
-fn copy_command_to_clipboard(command: &str) {
+fn copy_text_to_clipboard(text: &str) {
     let Some(display) = gdk::Display::default() else {
         return;
     };
 
-    display.clipboard().set_text(command);
+    display.clipboard().set_text(text);
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value { "yes" } else { "no" }
 }
 
 #[cfg(test)]
@@ -642,6 +663,8 @@ mod tests {
             started_at: at_millis(1_000),
             ended_at,
             exit_status,
+            output_bytes: Vec::new(),
+            output_truncated: false,
         }
     }
 
@@ -769,6 +792,29 @@ mod tests {
         assert_eq!(
             format_command_block_row(&block),
             "#15 · exit 0 · 10ms · <unknown command>"
+        );
+    }
+
+    #[test]
+    fn formats_command_block_row_with_output_metadata() {
+        let mut block = command_block(17, Some("seq 1 10"), Some(at_millis(1_084)), Some(0));
+        block.output_bytes = vec![b'x'; 12_700];
+
+        assert_eq!(
+            format_command_block_row(&block),
+            "#17 · exit 0 · 84ms · output: 12.4 KiB · output truncated: no · seq 1 10"
+        );
+    }
+
+    #[test]
+    fn formats_command_block_row_with_truncated_output_metadata() {
+        let mut block = command_block(18, Some("yes"), Some(at_millis(1_084)), Some(141));
+        block.output_bytes = vec![b'y'; 1_048_576];
+        block.output_truncated = true;
+
+        assert_eq!(
+            format_command_block_row(&block),
+            "#18 · exit 141 · 84ms · output: 1 MiB · output truncated: yes · yes"
         );
     }
 

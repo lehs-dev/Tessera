@@ -63,6 +63,8 @@ pub(crate) fn apply_semantic_event(
             snapshot.last_exit_status = *status;
             snapshot.command_count += 1;
         }
+        ShellSemanticEvent::CommandOutputChunk { .. }
+        | ShellSemanticEvent::CommandOutputTruncated { .. } => {}
     }
 }
 
@@ -159,5 +161,32 @@ mod tests {
         apply_semantic_event(&mut snapshot, &ShellSemanticEvent::PromptStart);
 
         assert_eq!(snapshot.state, CommandLifecycleState::Prompt);
+    }
+
+    #[test]
+    fn output_events_do_not_change_command_state() {
+        let mut snapshot = CommandStateSnapshot {
+            state: CommandLifecycleState::Running,
+            last_exit_status: None,
+            command_count: 0,
+        };
+
+        apply_semantic_event(
+            &mut snapshot,
+            &ShellSemanticEvent::command_output_chunk(b"hello"),
+        );
+        apply_semantic_event(
+            &mut snapshot,
+            &ShellSemanticEvent::CommandOutputTruncated { limit_bytes: 5 },
+        );
+
+        assert_eq!(
+            snapshot,
+            CommandStateSnapshot {
+                state: CommandLifecycleState::Running,
+                last_exit_status: None,
+                command_count: 0,
+            }
+        );
     }
 }

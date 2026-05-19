@@ -24,6 +24,8 @@ pub struct CommandBlock {
     pub started_at: SystemTime,
     pub ended_at: Option<SystemTime>,
     pub exit_status: Option<i32>,
+    pub output_bytes: Vec<u8>,
+    pub output_truncated: bool,
 }
 
 impl CommandBlock {
@@ -35,6 +37,272 @@ impl CommandBlock {
     pub fn is_finished(&self) -> bool {
         self.ended_at.is_some()
     }
+
+    pub fn has_output_metadata(&self) -> bool {
+        !self.output_bytes.is_empty() || self.output_truncated
+    }
+}
+
+pub(crate) fn format_command_block_markdown(block: &CommandBlock) -> String {
+    let mut markdown = format!(
+        "## Command Block #{}\n\n- State: {}\n- Exit status: {}\n- Duration: {}\n",
+        block.id.as_u64(),
+        command_block_state(block),
+        command_block_exit_status_for_markdown(block),
+        command_block_duration_for_markdown(block),
+    );
+
+    match command_text_for_export(block) {
+        Some(command) => {
+            markdown.push_str("- Command:\n\n");
+            markdown.push_str(&fenced_command_block(command));
+            markdown.push('\n');
+        }
+        None => {
+            markdown.push_str("- Command: <unknown command>\n");
+        }
+    }
+
+    if block.has_output_metadata() {
+        markdown.push_str(&format!(
+            "- Output: {}\n- Output truncated: {}\n",
+            format_command_block_output_size(block.output_bytes.len()),
+            yes_no(block.output_truncated),
+        ));
+    }
+
+    markdown
+}
+
+pub(crate) fn format_command_blocks_markdown_table(blocks: &[CommandBlock]) -> String {
+    if blocks.is_empty() {
+        return "_No command blocks._\n".to_string();
+    }
+
+    let includes_output_metadata = blocks.iter().any(CommandBlock::has_output_metadata);
+    let mut markdown = if includes_output_metadata {
+        "| Block | State | Exit status | Duration | Output | Output truncated | Command |\n| --- | --- | --- | --- | --- | --- | --- |\n".to_string()
+    } else {
+        "| Block | State | Exit status | Duration | Command |\n| --- | --- | --- | --- | --- |\n"
+            .to_string()
+    };
+
+    for block in blocks {
+        if includes_output_metadata {
+            markdown.push_str(&format!(
+                "| #{} | {} | {} | {} | {} | {} | {} |\n",
+                block.id.as_u64(),
+                command_block_state(block),
+                command_block_exit_status_for_markdown(block),
+                command_block_duration_for_markdown(block),
+                command_block_output_for_table(block),
+                command_block_output_truncated_for_table(block),
+                command_block_command_for_table(block),
+            ));
+        } else {
+            markdown.push_str(&format!(
+                "| #{} | {} | {} | {} | {} |\n",
+                block.id.as_u64(),
+                command_block_state(block),
+                command_block_exit_status_for_markdown(block),
+                command_block_duration_for_markdown(block),
+                command_block_command_for_table(block),
+            ));
+        }
+    }
+
+    markdown
+}
+
+#[allow(dead_code)]
+pub(crate) fn format_command_block_json(block: &CommandBlock) -> serde_json::Result<String> {
+    serde_json::to_string_pretty(&CommandBlockExport::from(block))
+}
+
+#[allow(dead_code)]
+pub(crate) fn format_command_blocks_json(blocks: &[CommandBlock]) -> serde_json::Result<String> {
+    let blocks = blocks
+        .iter()
+        .map(CommandBlockExport::from)
+        .collect::<Vec<_>>();
+
+    serde_json::to_string_pretty(&blocks)
+}
+
+pub(crate) fn format_command_block_duration(duration: Duration) -> String {
+    if duration.as_millis() < 1_000 {
+        return format!("{}ms", duration.as_millis());
+    }
+
+    let seconds = duration.as_secs_f64();
+    if seconds < 10.0 {
+        let mut formatted = format!("{seconds:.1}");
+        if formatted.ends_with(".0") {
+            formatted.truncate(formatted.len() - 2);
+        }
+
+        return format!("{formatted}s");
+    }
+
+    format!("{}s", duration.as_secs())
+}
+
+pub(crate) fn format_command_block_output_size(bytes: usize) -> String {
+    format_byte_size(bytes)
+}
+
+fn command_block_state(block: &CommandBlock) -> &'static str {
+    if block.ended_at.is_some() {
+        "finished"
+    } else {
+        "running"
+    }
+}
+
+fn command_block_exit_status_for_markdown(block: &CommandBlock) -> String {
+    if block.ended_at.is_none() {
+        return "unfinished".to_string();
+    }
+
+    match block.exit_status {
+        Some(status) => status.to_string(),
+        None => "unknown".to_string(),
+    }
+}
+
+fn command_block_duration_for_markdown(block: &CommandBlock) -> String {
+    match block.duration() {
+        Some(duration) => format_command_block_duration(duration),
+        None if block.ended_at.is_some() => "unknown".to_string(),
+        None => "unfinished".to_string(),
+    }
+}
+
+fn command_block_output_for_table(block: &CommandBlock) -> String {
+    if block.has_output_metadata() {
+        format_command_block_output_size(block.output_bytes.len())
+    } else {
+        String::new()
+    }
+}
+
+fn command_block_output_truncated_for_table(block: &CommandBlock) -> String {
+    if block.has_output_metadata() {
+        yes_no(block.output_truncated).to_string()
+    } else {
+        String::new()
+    }
+}
+
+fn format_byte_size(bytes: usize) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+
+    let bytes = bytes as f64;
+    if bytes < MIB {
+        return format_decimal_size(bytes / KIB, "KiB");
+    }
+
+    format_decimal_size(bytes / MIB, "MiB")
+}
+
+fn format_decimal_size(value: f64, unit: &str) -> String {
+    let mut formatted = format!("{value:.1}");
+    if formatted.ends_with(".0") {
+        formatted.truncate(formatted.len() - 2);
+    }
+
+    format!("{formatted} {unit}")
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value { "yes" } else { "no" }
+}
+
+fn command_text_for_export(block: &CommandBlock) -> Option<&str> {
+    let command = block.command.as_deref()?;
+
+    if command.trim().is_empty() {
+        return None;
+    }
+
+    Some(command)
+}
+
+fn command_block_command_for_table(block: &CommandBlock) -> String {
+    command_text_for_export(block)
+        .map(escape_markdown_table_cell)
+        .unwrap_or_else(|| "<unknown command>".to_string())
+}
+
+fn escape_markdown_table_cell(text: &str) -> String {
+    text.replace('\\', "\\\\")
+        .replace('|', "\\|")
+        .replace('\r', "\\r")
+        .replace('\n', "<br>")
+}
+
+fn fenced_command_block(command: &str) -> String {
+    let fence = "`".repeat(longest_backtick_run(command).saturating_add(1).max(3));
+
+    format!("{fence}sh\n{command}\n{fence}")
+}
+
+fn longest_backtick_run(text: &str) -> usize {
+    let mut longest = 0;
+    let mut current = 0;
+
+    for char in text.chars() {
+        if char == '`' {
+            current += 1;
+            longest = longest.max(current);
+        } else {
+            current = 0;
+        }
+    }
+
+    longest
+}
+
+#[derive(Debug, serde::Serialize)]
+struct CommandBlockExport<'a> {
+    id: u64,
+    session_id: u64,
+    command: Option<&'a str>,
+    state: &'static str,
+    exit_status: Option<i32>,
+    duration_ms: Option<u128>,
+    #[serde(skip_serializing_if = "is_zero")]
+    output_size_bytes: usize,
+    #[serde(skip_serializing_if = "is_false")]
+    output_truncated: bool,
+}
+
+impl<'a> From<&'a CommandBlock> for CommandBlockExport<'a> {
+    fn from(block: &'a CommandBlock) -> Self {
+        Self {
+            id: block.id.as_u64(),
+            session_id: block.session_id.as_u64(),
+            command: command_text_for_export(block),
+            state: command_block_state(block),
+            exit_status: block.exit_status,
+            duration_ms: block.duration().map(|duration| duration.as_millis()),
+            output_size_bytes: block.output_bytes.len(),
+            output_truncated: block.output_truncated,
+        }
+    }
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[allow(dead_code)]
@@ -76,6 +344,19 @@ impl CommandBlockTracker {
             status,
             now,
         );
+    }
+
+    pub fn append_output_chunk(&mut self, bytes: &[u8]) {
+        append_command_output_chunk(
+            self.session_id,
+            &mut self.blocks,
+            self.current_block_id,
+            bytes,
+        );
+    }
+
+    pub fn mark_output_truncated(&mut self) {
+        mark_command_output_truncated(self.session_id, &mut self.blocks, self.current_block_id);
     }
 
     pub fn blocks(&self) -> &[CommandBlock] {
@@ -137,6 +418,8 @@ pub(crate) fn start_command_block(
         started_at: now,
         ended_at: None,
         exit_status: None,
+        output_bytes: Vec::new(),
+        output_truncated: false,
     });
     *current_block_id = Some(id);
 
@@ -178,11 +461,65 @@ pub(crate) fn finish_command_block(
     );
 }
 
+pub(crate) fn append_command_output_chunk(
+    session_id: TerminalSessionId,
+    blocks: &mut [CommandBlock],
+    current_block_id: Option<CommandBlockId>,
+    bytes: &[u8],
+) {
+    if bytes.is_empty() {
+        return;
+    }
+
+    let Some(block_id) = current_block_id else {
+        eprintln!(
+            "Terminal session {session_id:?} command output chunk received without a current block"
+        );
+        return;
+    };
+
+    let Some(block) = blocks.iter_mut().find(|block| block.id == block_id) else {
+        eprintln!(
+            "Terminal session {session_id:?} current command block {} was missing for output chunk",
+            block_id.as_u64()
+        );
+        return;
+    };
+
+    block.output_bytes.extend_from_slice(bytes);
+}
+
+pub(crate) fn mark_command_output_truncated(
+    session_id: TerminalSessionId,
+    blocks: &mut [CommandBlock],
+    current_block_id: Option<CommandBlockId>,
+) {
+    let Some(block_id) = current_block_id else {
+        eprintln!(
+            "Terminal session {session_id:?} command output truncation received without a current block"
+        );
+        return;
+    };
+
+    let Some(block) = blocks.iter_mut().find(|block| block.id == block_id) else {
+        eprintln!(
+            "Terminal session {session_id:?} current command block {} was missing for output truncation",
+            block_id.as_u64()
+        );
+        return;
+    };
+
+    block.output_truncated = true;
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
-    use super::CommandBlockTracker;
+    use super::{
+        CommandBlock, CommandBlockId, CommandBlockTracker, format_command_block_markdown,
+        format_command_blocks_markdown_table,
+    };
     use crate::terminal::TerminalSessionId;
 
     fn session_id() -> TerminalSessionId {
@@ -191,6 +528,28 @@ mod tests {
 
     fn at(seconds: u64) -> std::time::SystemTime {
         UNIX_EPOCH + Duration::from_secs(seconds)
+    }
+
+    fn at_millis(millis: u64) -> std::time::SystemTime {
+        UNIX_EPOCH + Duration::from_millis(millis)
+    }
+
+    fn command_block(
+        id: u64,
+        command: Option<&str>,
+        ended_at: Option<std::time::SystemTime>,
+        exit_status: Option<i32>,
+    ) -> CommandBlock {
+        CommandBlock {
+            id: CommandBlockId::for_tests(id),
+            session_id: session_id(),
+            command: command.map(str::to_string),
+            started_at: at_millis(1_000),
+            ended_at,
+            exit_status,
+            output_bytes: Vec::new(),
+            output_truncated: false,
+        }
     }
 
     #[test]
@@ -207,6 +566,8 @@ mod tests {
         assert_eq!(blocks[0].started_at, at(10));
         assert_eq!(blocks[0].ended_at, None);
         assert_eq!(blocks[0].exit_status, None);
+        assert_eq!(blocks[0].output_bytes, Vec::<u8>::new());
+        assert!(!blocks[0].output_truncated);
         assert_eq!(tracker.current_block(), Some(&blocks[0]));
     }
 
@@ -292,5 +653,184 @@ mod tests {
         assert_eq!(blocks[1].command.as_deref(), Some("echo next"));
         assert_eq!(blocks[1].ended_at, None);
         assert_eq!(tracker.current_block(), Some(&blocks[1]));
+    }
+
+    #[test]
+    fn output_chunk_appends_to_current_block() {
+        let mut tracker = CommandBlockTracker::new(session_id());
+
+        tracker.command_started(Some("echo hello".to_string()), at(10));
+        tracker.append_output_chunk(b"hello");
+        tracker.append_output_chunk(b"\n");
+
+        let block = &tracker.blocks()[0];
+        assert_eq!(block.output_bytes, b"hello\n");
+        assert!(!block.output_truncated);
+    }
+
+    #[test]
+    fn output_chunk_without_current_block_does_not_panic() {
+        let mut tracker = CommandBlockTracker::new(session_id());
+
+        tracker.append_output_chunk(b"orphan output");
+
+        assert!(tracker.blocks().is_empty());
+        assert_eq!(tracker.current_block(), None);
+    }
+
+    #[test]
+    fn output_truncated_marks_current_block() {
+        let mut tracker = CommandBlockTracker::new(session_id());
+
+        tracker.command_started(Some("seq 1 1000000".to_string()), at(10));
+        tracker.mark_output_truncated();
+
+        assert!(tracker.blocks()[0].output_truncated);
+    }
+
+    #[test]
+    fn formats_successful_command_block_markdown() {
+        let block = command_block(12, Some("echo hello"), Some(at_millis(1_084)), Some(0));
+
+        assert_eq!(
+            format_command_block_markdown(&block),
+            concat!(
+                "## Command Block #12\n\n",
+                "- State: finished\n",
+                "- Exit status: 0\n",
+                "- Duration: 84ms\n",
+                "- Command:\n\n",
+                "```sh\n",
+                "echo hello\n",
+                "```\n"
+            )
+        );
+    }
+
+    #[test]
+    fn formats_command_block_markdown_with_output_metadata() {
+        let mut block = command_block(17, Some("echo hello"), Some(at_millis(1_084)), Some(0));
+        block.output_bytes = b"hello\n".to_vec();
+
+        assert_eq!(
+            format_command_block_markdown(&block),
+            concat!(
+                "## Command Block #17\n\n",
+                "- State: finished\n",
+                "- Exit status: 0\n",
+                "- Duration: 84ms\n",
+                "- Command:\n\n",
+                "```sh\n",
+                "echo hello\n",
+                "```\n",
+                "- Output: 6 B\n",
+                "- Output truncated: no\n",
+            )
+        );
+    }
+
+    #[test]
+    fn formats_failed_command_block_markdown() {
+        let block = command_block(13, Some("false"), Some(at_millis(1_042)), Some(1));
+
+        assert_eq!(
+            format_command_block_markdown(&block),
+            concat!(
+                "## Command Block #13\n\n",
+                "- State: finished\n",
+                "- Exit status: 1\n",
+                "- Duration: 42ms\n",
+                "- Command:\n\n",
+                "```sh\n",
+                "false\n",
+                "```\n"
+            )
+        );
+    }
+
+    #[test]
+    fn formats_running_command_block_markdown() {
+        let block = command_block(14, Some("sleep 10"), None, None);
+
+        assert_eq!(
+            format_command_block_markdown(&block),
+            concat!(
+                "## Command Block #14\n\n",
+                "- State: running\n",
+                "- Exit status: unfinished\n",
+                "- Duration: unfinished\n",
+                "- Command:\n\n",
+                "```sh\n",
+                "sleep 10\n",
+                "```\n"
+            )
+        );
+    }
+
+    #[test]
+    fn formats_unknown_command_block_markdown() {
+        let block = command_block(15, None, Some(at_millis(1_010)), Some(0));
+
+        assert_eq!(
+            format_command_block_markdown(&block),
+            concat!(
+                "## Command Block #15\n\n",
+                "- State: finished\n",
+                "- Exit status: 0\n",
+                "- Duration: 10ms\n",
+                "- Command: <unknown command>\n"
+            )
+        );
+    }
+
+    #[test]
+    fn preserves_long_commands_in_command_block_markdown() {
+        let command = "printf 'this is a deliberately long command that keeps going past the row limit and should not be truncated in Markdown exports'";
+        let block = command_block(16, Some(command), Some(at_millis(1_001)), Some(0));
+        let block_markdown = format_command_block_markdown(&block);
+        let table_markdown = format_command_blocks_markdown_table(&[block]);
+
+        assert!(block_markdown.contains(command));
+        assert!(table_markdown.contains(command));
+        assert!(!block_markdown.contains("..."));
+        assert!(!table_markdown.contains("..."));
+    }
+
+    #[test]
+    fn formats_recent_command_blocks_markdown_table() {
+        let blocks = [
+            command_block(12, Some("echo hello"), Some(at_millis(1_084)), Some(0)),
+            command_block(13, Some("sleep 10"), None, None),
+        ];
+
+        assert_eq!(
+            format_command_blocks_markdown_table(&blocks),
+            concat!(
+                "| Block | State | Exit status | Duration | Command |\n",
+                "| --- | --- | --- | --- | --- |\n",
+                "| #12 | finished | 0 | 84ms | echo hello |\n",
+                "| #13 | running | unfinished | unfinished | sleep 10 |\n"
+            )
+        );
+    }
+
+    #[test]
+    fn formats_recent_command_blocks_markdown_table_with_output_metadata() {
+        let mut first = command_block(12, Some("echo hello"), Some(at_millis(1_084)), Some(0));
+        first.output_bytes = b"hello\n".to_vec();
+        let mut second = command_block(13, Some("seq 1 10000"), Some(at_millis(1_090)), Some(0));
+        second.output_bytes = vec![b'x'; 1536];
+        second.output_truncated = true;
+        let blocks = [first, second];
+
+        assert_eq!(
+            format_command_blocks_markdown_table(&blocks),
+            concat!(
+                "| Block | State | Exit status | Duration | Output | Output truncated | Command |\n",
+                "| --- | --- | --- | --- | --- | --- | --- |\n",
+                "| #12 | finished | 0 | 84ms | 6 B | no | echo hello |\n",
+                "| #13 | finished | 0 | 90ms | 1.5 KiB | yes | seq 1 10000 |\n"
+            )
+        );
     }
 }

@@ -12,6 +12,12 @@ pub enum Osc133Event {
     CommandFinished { status: Option<i32> },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Osc133Record {
+    Output(Vec<u8>),
+    Event(Osc133Event),
+}
+
 #[derive(Debug, Default)]
 pub struct Osc133Parser {
     buffer: Vec<u8>,
@@ -27,49 +33,77 @@ impl Osc133Parser {
     }
 
     pub fn push(&mut self, bytes: &[u8]) -> Vec<Osc133Event> {
-        self.buffer.extend_from_slice(bytes);
-        self.enforce_buffer_limit();
+        self.push_records(bytes)
+            .into_iter()
+            .filter_map(|record| match record {
+                Osc133Record::Event(event) => Some(event),
+                Osc133Record::Output(_) => None,
+            })
+            .collect()
+    }
 
-        let mut events = Vec::new();
+    pub fn push_records(&mut self, bytes: &[u8]) -> Vec<Osc133Record> {
+        self.buffer.extend_from_slice(bytes);
+
+        let mut records = Vec::new();
 
         loop {
             let Some(introducer_index) = find_subsequence(&self.buffer, OSC_INTRODUCER) else {
-                self.discard_non_osc_bytes();
+                self.drain_non_osc_bytes(&mut records);
                 break;
             };
 
             if introducer_index > 0 {
-                self.buffer.drain(..introducer_index);
+                records.push(Osc133Record::Output(
+                    self.buffer.drain(..introducer_index).collect(),
+                ));
             }
 
             let Some((terminator_index, terminator_len)) =
                 find_terminator(&self.buffer, OSC_INTRODUCER.len())
             else {
+                self.enforce_buffer_limit(&mut records);
                 break;
             };
 
             let payload = &self.buffer[OSC_INTRODUCER.len()..terminator_index];
             if let Some(event) = parse_payload(payload, self.parse_extended_markers) {
-                events.push(event);
+                records.push(Osc133Record::Event(event));
+            } else {
+                records.push(Osc133Record::Output(
+                    self.buffer[..terminator_index + terminator_len].to_vec(),
+                ));
             }
 
             self.buffer.drain(..terminator_index + terminator_len);
         }
 
-        events
+        records
     }
 
-    fn enforce_buffer_limit(&mut self) {
+    fn enforce_buffer_limit(&mut self, records: &mut Vec<Osc133Record>) {
         if self.buffer.len() > MAX_BUFFER_LEN {
-            self.buffer.drain(..self.buffer.len() - MAX_BUFFER_LEN);
+            let drain_len = self.buffer.len() - MAX_BUFFER_LEN;
+            records.push(Osc133Record::Output(
+                self.buffer.drain(..drain_len).collect(),
+            ));
         }
     }
 
-    fn discard_non_osc_bytes(&mut self) {
+    fn drain_non_osc_bytes(&mut self, records: &mut Vec<Osc133Record>) {
+        if self.buffer.is_empty() {
+            return;
+        }
+
         if self.buffer.last() == Some(&ESC) {
-            self.buffer.drain(..self.buffer.len() - 1);
+            if self.buffer.len() > 1 {
+                let drain_len = self.buffer.len() - 1;
+                records.push(Osc133Record::Output(
+                    self.buffer.drain(..drain_len).collect(),
+                ));
+            }
         } else {
-            self.buffer.clear();
+            records.push(Osc133Record::Output(self.buffer.drain(..).collect()));
         }
     }
 }
@@ -170,7 +204,7 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_BUFFER_LEN, Osc133Event, Osc133Parser};
+    use super::{MAX_BUFFER_LEN, Osc133Event, Osc133Parser, Osc133Record};
 
     #[test]
     fn parses_prompt_start_bel_terminated() {
@@ -321,6 +355,34 @@ mod tests {
                 Osc133Event::PromptEnd,
                 Osc133Event::CommandStart { command: None },
                 Osc133Event::CommandFinished { status: Some(1) },
+            ]
+        );
+    }
+
+    #[test]
+    fn record_stream_preserves_output_order_and_removes_osc133_markers() {
+        let mut parser = Osc133Parser::default();
+
+        assert_eq!(
+            parser.push_records(b"\x1b]133;C\x07hello\n\x1b]133;D;0\x07"),
+            vec![
+                Osc133Record::Event(Osc133Event::CommandStart { command: None }),
+                Osc133Record::Output(b"hello\n".to_vec()),
+                Osc133Record::Event(Osc133Event::CommandFinished { status: Some(0) }),
+            ]
+        );
+    }
+
+    #[test]
+    fn record_stream_preserves_non_osc133_sequences_as_output() {
+        let mut parser = Osc133Parser::default();
+
+        assert_eq!(
+            parser.push_records(b"before\x1b]0;title\x07after"),
+            vec![
+                Osc133Record::Output(b"before".to_vec()),
+                Osc133Record::Output(b"\x1b]0;title\x07".to_vec()),
+                Osc133Record::Output(b"after".to_vec()),
             ]
         );
     }

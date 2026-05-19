@@ -14,12 +14,18 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
-use tessera::shell_integration::{event::ShellSemanticEvent, osc133::Osc133Parser};
+use tessera::shell_integration::{
+    event::ShellSemanticEvent,
+    osc133::{Osc133Parser, Osc133Record},
+};
 
 const READ_BUFFER_LEN: usize = 8 * 1024;
 const FISH_INTEGRATION_SCRIPT: &str = "tessera.fish";
 const SHELL_INTEGRATION_DIR_ENV: &str = "TESSERA_SHELL_INTEGRATION_DIR";
 const SHELL_INTEGRATION_ENABLED_ENV: &str = "TESSERA_ENABLE_SHELL_INTEGRATION";
+const OUTPUT_CAPTURE_ENABLED_ENV: &str = "TESSERA_ENABLE_OUTPUT_CAPTURE";
+const OUTPUT_CAPTURE_LIMIT_ENV: &str = "TESSERA_OUTPUT_CAPTURE_LIMIT";
+const DEFAULT_OUTPUT_CAPTURE_LIMIT: usize = 1024 * 1024;
 
 fn main() -> ExitCode {
     match run() {
@@ -46,9 +52,16 @@ fn run() -> Result<ExitCode> {
     let master = unsafe { File::from_raw_fd(pty.master.into_raw_fd()) };
     let pty_writer = master.try_clone().context("could not clone PTY master")?;
     let _stdin_relay = thread::spawn(move || relay_stdin_to_pty(pty_writer));
+    let output_capture =
+        OutputCapture::from_env(parse_extended_osc133, event_sink.is_protocol_channel());
 
-    relay_pty_to_stdout(master, &mut event_sink, parse_extended_osc133)
-        .context("could not relay PTY output")?;
+    relay_pty_to_stdout(
+        master,
+        &mut event_sink,
+        parse_extended_osc133,
+        output_capture,
+    )
+    .context("could not relay PTY output")?;
 
     let status = child.wait().context("could not wait for shell process")?;
     Ok(exit_code_from_status(status))
@@ -169,7 +182,7 @@ impl ShellLaunch {
 }
 
 fn shell_integration_enabled() -> bool {
-    matches!(env::var(SHELL_INTEGRATION_ENABLED_ENV), Ok(value) if value == "1")
+    env_flag_enabled(SHELL_INTEGRATION_ENABLED_ENV)
 }
 
 fn is_fish_shell(shell: &str) -> bool {
@@ -310,6 +323,7 @@ fn relay_pty_to_stdout(
     mut pty_reader: File,
     event_sink: &mut EventSink,
     parse_extended_osc133: bool,
+    mut output_capture: OutputCapture,
 ) -> Result<()> {
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
@@ -347,14 +361,165 @@ fn relay_pty_to_stdout(
             return Err(error).context("could not flush stdout");
         }
 
-        for event in parser.push(output) {
-            event_sink
-                .write_event(ShellSemanticEvent::from(event))
-                .context("could not write semantic shell event")?;
+        for record in parser.push_records(output) {
+            match record {
+                Osc133Record::Output(output) => output_capture
+                    .write_output(&output, event_sink)
+                    .context("could not write command output capture event")?,
+                Osc133Record::Event(event) => {
+                    let event = ShellSemanticEvent::from(event);
+                    event_sink
+                        .write_event(event.clone())
+                        .context("could not write semantic shell event")?;
+                    output_capture.observe_event(&event);
+                }
+            }
         }
     }
 
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OutputCapture {
+    enabled: bool,
+    limit: usize,
+    running: bool,
+    captured_bytes: usize,
+    truncated: bool,
+}
+
+impl OutputCapture {
+    fn from_env(shell_integration_active: bool, event_protocol_available: bool) -> Self {
+        if !env_flag_enabled(OUTPUT_CAPTURE_ENABLED_ENV) {
+            return Self::disabled();
+        }
+
+        if !shell_integration_active {
+            eprintln!(
+                "tessera-pty-proxy: output capture requested but shell integration is inactive"
+            );
+            return Self::disabled();
+        }
+
+        if !event_protocol_available {
+            eprintln!("tessera-pty-proxy: output capture requested but TESSERA_EVENT_FD is unset");
+            return Self::disabled();
+        }
+
+        Self {
+            enabled: true,
+            limit: output_capture_limit_from_env(),
+            running: false,
+            captured_bytes: 0,
+            truncated: false,
+        }
+    }
+
+    fn disabled() -> Self {
+        Self {
+            enabled: false,
+            limit: DEFAULT_OUTPUT_CAPTURE_LIMIT,
+            running: false,
+            captured_bytes: 0,
+            truncated: false,
+        }
+    }
+
+    #[cfg(test)]
+    fn enabled_for_tests(limit: usize) -> Self {
+        Self {
+            enabled: true,
+            limit,
+            running: false,
+            captured_bytes: 0,
+            truncated: false,
+        }
+    }
+
+    fn observe_event(&mut self, event: &ShellSemanticEvent) {
+        if !self.enabled {
+            return;
+        }
+
+        match event {
+            ShellSemanticEvent::CommandStart { .. } => {
+                self.running = true;
+                self.captured_bytes = 0;
+                self.truncated = false;
+            }
+            ShellSemanticEvent::CommandFinished { .. } => {
+                self.running = false;
+            }
+            ShellSemanticEvent::PromptStart
+            | ShellSemanticEvent::PromptEnd
+            | ShellSemanticEvent::CommandOutputChunk { .. }
+            | ShellSemanticEvent::CommandOutputTruncated { .. } => {}
+        }
+    }
+
+    fn write_output(&mut self, output: &[u8], event_sink: &mut EventSink) -> Result<()> {
+        for event in self.capture_output_events(output) {
+            event_sink.write_event(event)?;
+        }
+
+        Ok(())
+    }
+
+    fn capture_output_events(&mut self, output: &[u8]) -> Vec<ShellSemanticEvent> {
+        if !self.enabled || !self.running || output.is_empty() || self.truncated {
+            return Vec::new();
+        }
+
+        let remaining = self.limit.saturating_sub(self.captured_bytes);
+        let capture_len = remaining.min(output.len());
+        let mut events = Vec::new();
+
+        if capture_len > 0 {
+            self.captured_bytes += capture_len;
+            events.push(ShellSemanticEvent::command_output_chunk(
+                &output[..capture_len],
+            ));
+        }
+
+        if capture_len < output.len() {
+            self.truncated = true;
+            events.push(ShellSemanticEvent::CommandOutputTruncated {
+                limit_bytes: self.limit_as_u64(),
+            });
+        }
+
+        events
+    }
+
+    fn limit_as_u64(&self) -> u64 {
+        self.limit.try_into().unwrap_or(u64::MAX)
+    }
+}
+
+fn env_flag_enabled(key: &str) -> bool {
+    matches!(env::var(key), Ok(value) if value == "1")
+}
+
+fn output_capture_limit_from_env() -> usize {
+    match env::var(OUTPUT_CAPTURE_LIMIT_ENV) {
+        Ok(value) => match value.parse::<usize>() {
+            Ok(limit) => limit,
+            Err(_) => {
+                eprintln!(
+                    "tessera-pty-proxy: invalid {OUTPUT_CAPTURE_LIMIT_ENV}={value:?}; using {DEFAULT_OUTPUT_CAPTURE_LIMIT}"
+                );
+                DEFAULT_OUTPUT_CAPTURE_LIMIT
+            }
+        },
+        Err(env::VarError::NotPresent) => DEFAULT_OUTPUT_CAPTURE_LIMIT,
+        Err(env::VarError::NotUnicode(_)) => {
+            eprintln!(
+                "tessera-pty-proxy: {OUTPUT_CAPTURE_LIMIT_ENV} must be valid Unicode; using {DEFAULT_OUTPUT_CAPTURE_LIMIT}"
+            );
+            DEFAULT_OUTPUT_CAPTURE_LIMIT
+        }
+    }
 }
 
 enum EventSink {
@@ -363,6 +528,10 @@ enum EventSink {
 }
 
 impl EventSink {
+    fn is_protocol_channel(&self) -> bool {
+        matches!(self, Self::Protocol(_))
+    }
+
     fn from_env() -> Result<Self> {
         let fd = match env::var("TESSERA_EVENT_FD") {
             Ok(fd) => fd,
@@ -491,7 +660,11 @@ fn exit_code_from_status(status: ExitStatus) -> ExitCode {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use super::{development_fish_integration_script_path, fish_single_quoted, is_fish_shell};
+    use tessera::shell_integration::event::{ShellSemanticEvent, decode_base64};
+
+    use super::{
+        OutputCapture, development_fish_integration_script_path, fish_single_quoted, is_fish_shell,
+    };
 
     #[test]
     fn detects_fish_shell_by_basename() {
@@ -529,5 +702,87 @@ mod tests {
             fish_single_quoted("/tmp/back\\slash/tessera.fish"),
             "'/tmp/back\\\\slash/tessera.fish'"
         );
+    }
+
+    #[test]
+    fn output_capture_ignores_output_until_command_is_running() {
+        let mut capture = OutputCapture::enabled_for_tests(1024);
+
+        assert!(capture.capture_output_events(b"prompt").is_empty());
+    }
+
+    #[test]
+    fn output_capture_emits_chunks_while_command_is_running() {
+        let mut capture = OutputCapture::enabled_for_tests(1024);
+        capture.observe_event(&ShellSemanticEvent::CommandStart { command: None });
+
+        let events = capture.capture_output_events(b"hello\n");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(output_chunk_bytes(&events[0]), b"hello\n");
+    }
+
+    #[test]
+    fn output_capture_stops_after_command_finished() {
+        let mut capture = OutputCapture::enabled_for_tests(1024);
+        capture.observe_event(&ShellSemanticEvent::CommandStart { command: None });
+        capture.observe_event(&ShellSemanticEvent::CommandFinished { status: Some(0) });
+
+        assert!(capture.capture_output_events(b"next prompt").is_empty());
+    }
+
+    #[test]
+    fn output_capture_enforces_limit_and_reports_truncation_once() {
+        let mut capture = OutputCapture::enabled_for_tests(5);
+        capture.observe_event(&ShellSemanticEvent::CommandStart { command: None });
+
+        let first_events = capture.capture_output_events(b"hello");
+        let second_events = capture.capture_output_events(b" world");
+        let third_events = capture.capture_output_events(b" ignored");
+
+        assert_eq!(first_events.len(), 1);
+        assert_eq!(output_chunk_bytes(&first_events[0]), b"hello");
+        assert_eq!(
+            second_events,
+            vec![ShellSemanticEvent::CommandOutputTruncated { limit_bytes: 5 }]
+        );
+        assert!(third_events.is_empty());
+    }
+
+    #[test]
+    fn output_capture_truncates_partial_chunk_at_limit() {
+        let mut capture = OutputCapture::enabled_for_tests(8);
+        capture.observe_event(&ShellSemanticEvent::CommandStart { command: None });
+
+        let events = capture.capture_output_events(b"hello world");
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(output_chunk_bytes(&events[0]), b"hello wo");
+        assert_eq!(
+            events[1],
+            ShellSemanticEvent::CommandOutputTruncated { limit_bytes: 8 }
+        );
+    }
+
+    #[test]
+    fn output_capture_resets_limit_for_next_command() {
+        let mut capture = OutputCapture::enabled_for_tests(3);
+        capture.observe_event(&ShellSemanticEvent::CommandStart { command: None });
+        capture.capture_output_events(b"abcd");
+        capture.observe_event(&ShellSemanticEvent::CommandFinished { status: Some(0) });
+        capture.observe_event(&ShellSemanticEvent::CommandStart { command: None });
+
+        let events = capture.capture_output_events(b"xy");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(output_chunk_bytes(&events[0]), b"xy");
+    }
+
+    fn output_chunk_bytes(event: &ShellSemanticEvent) -> Vec<u8> {
+        let ShellSemanticEvent::CommandOutputChunk { bytes_base64 } = event else {
+            panic!("expected command output chunk, got {event:?}");
+        };
+
+        decode_base64(bytes_base64).unwrap()
     }
 }

@@ -15,10 +15,13 @@ use anyhow::{Context, anyhow};
 use futures_channel::mpsc::{self, UnboundedSender};
 use futures_util::StreamExt;
 use gtk::{gdk, prelude::*};
-use tessera::shell_integration::event::ShellSemanticEvent;
+use tessera::shell_integration::event::{ShellSemanticEvent, decode_base64};
 use vte::prelude::*;
 
-use super::command_block::{finish_command_block, start_command_block};
+use super::command_block::{
+    append_command_output_chunk, finish_command_block, mark_command_output_truncated,
+    start_command_block,
+};
 use super::command_input::{
     can_accept_command_input_state, normalized_command_for_insert, normalized_command_for_run,
 };
@@ -415,6 +418,30 @@ impl TerminalSession {
                         );
 
                         current_block_id.set(current);
+                    }
+                    ShellSemanticEvent::CommandOutputChunk { bytes_base64 } => {
+                        match decode_base64(bytes_base64) {
+                            Ok(bytes) => {
+                                let mut blocks = blocks.borrow_mut();
+
+                                append_command_output_chunk(
+                                    id,
+                                    &mut blocks,
+                                    current_block_id.get(),
+                                    &bytes,
+                                );
+                            }
+                            Err(error) => {
+                                eprintln!(
+                                    "Terminal session {id:?} malformed command output chunk: {error}"
+                                );
+                            }
+                        }
+                    }
+                    ShellSemanticEvent::CommandOutputTruncated { .. } => {
+                        let mut blocks = blocks.borrow_mut();
+
+                        mark_command_output_truncated(id, &mut blocks, current_block_id.get());
                     }
                     ShellSemanticEvent::PromptStart | ShellSemanticEvent::PromptEnd => {}
                 }
