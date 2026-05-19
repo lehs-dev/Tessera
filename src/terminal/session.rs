@@ -169,6 +169,15 @@ impl TerminalSession {
         self.blocks.borrow().clone()
     }
 
+    /// Returns at most `limit` of the most recent command blocks in chronological
+    /// order, with the newest block last.
+    pub fn recent_blocks(&self, limit: usize) -> Vec<CommandBlock> {
+        let blocks = self.blocks.borrow();
+        let start = blocks.len().saturating_sub(limit);
+
+        blocks[start..].to_vec()
+    }
+
     #[allow(dead_code)]
     pub fn current_block(&self) -> Option<CommandBlock> {
         let current_block_id = self.current_block_id.get()?;

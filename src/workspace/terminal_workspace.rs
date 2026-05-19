@@ -4,12 +4,17 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use adw::prelude::*;
+use glib::object::IsA;
+use gtk::{gdk, pango};
 
 use crate::terminal::{
-    CommandLifecycleState, TerminalSession, TerminalSessionId, TerminalSessionSnapshot,
+    CommandBlock, CommandLifecycleState, TerminalSession, TerminalSessionId,
+    TerminalSessionSnapshot,
 };
 
 const COMMAND_DISPLAY_MAX_CHARS: usize = 48;
+const COMMAND_BLOCK_DISPLAY_MAX_CHARS: usize = 72;
+const RECENT_COMMAND_BLOCK_LIMIT: usize = 20;
 
 pub struct TerminalWorkspace {
     toolbar_view: adw::ToolbarView,
@@ -27,11 +32,13 @@ impl TerminalWorkspace {
         let window_title = adw::WindowTitle::builder().title("Terminal").build();
 
         let header_bar_new_tab_btn = new_tab_button();
+        let header_bar_recent_blocks_btn = recent_blocks_button();
         let header_bar = adw::HeaderBar::builder()
             .show_end_title_buttons(true)
             .title_widget(&window_title)
             .build();
         header_bar.pack_end(&header_bar_new_tab_btn);
+        header_bar.pack_end(&header_bar_recent_blocks_btn);
 
         let tab_bar = adw::TabBar::builder()
             .view(&tab_view)
@@ -43,6 +50,7 @@ impl TerminalWorkspace {
         tab_bar_start_controls.set_valign(gtk::Align::Center);
 
         let tab_bar_new_tab_btn = new_tab_button();
+        let tab_bar_recent_blocks_btn = recent_blocks_button();
         let tab_bar_end_controls = gtk::WindowControls::new(gtk::PackType::End);
         tab_bar_end_controls.set_valign(gtk::Align::Center);
 
@@ -50,6 +58,7 @@ impl TerminalWorkspace {
             .orientation(gtk::Orientation::Horizontal)
             .valign(gtk::Align::Center)
             .build();
+        tab_bar_end_box.append(&tab_bar_recent_blocks_btn);
         tab_bar_end_box.append(&tab_bar_new_tab_btn);
         tab_bar_end_box.append(&tab_bar_end_controls);
 
@@ -228,6 +237,43 @@ impl TerminalWorkspace {
     pub fn active_session_id(&self) -> Option<TerminalSessionId> {
         self.active_session().map(|s| s.id())
     }
+
+    pub fn show_recent_blocks(&self, parent: &impl IsA<gtk::Window>) {
+        let Some(session) = self.active_session() else {
+            return;
+        };
+
+        let window = gtk::Window::builder()
+            .title("Recent Command Blocks")
+            .default_width(640)
+            .default_height(420)
+            .modal(false)
+            .transient_for(parent)
+            .destroy_with_parent(true)
+            .build();
+
+        if let Some(application) = parent.application() {
+            window.set_application(Some(&application));
+        }
+
+        let title = adw::WindowTitle::builder()
+            .title("Recent Command Blocks")
+            .subtitle(format!("Session {}", session.id().as_u64()))
+            .build();
+        let header_bar = adw::HeaderBar::builder()
+            .show_end_title_buttons(true)
+            .title_widget(&title)
+            .build();
+
+        let toolbar_view = adw::ToolbarView::new();
+        toolbar_view.add_top_bar(&header_bar);
+        toolbar_view.set_content(Some(&recent_blocks_content(
+            &session.recent_blocks(RECENT_COMMAND_BLOCK_LIMIT),
+        )));
+
+        window.set_child(Some(&toolbar_view));
+        window.present();
+    }
 }
 
 fn update_window_title(tab_view: &adw::TabView, window_title: &adw::WindowTitle) {
@@ -328,11 +374,15 @@ fn command_for_display(command: Option<&str>) -> Option<String> {
 }
 
 fn truncate_command_for_display(command: &str) -> String {
-    if command.chars().count() <= COMMAND_DISPLAY_MAX_CHARS {
+    truncate_text_for_display(command, COMMAND_DISPLAY_MAX_CHARS)
+}
+
+fn truncate_text_for_display(command: &str, max_chars: usize) -> String {
+    if command.chars().count() <= max_chars {
         return command.to_string();
     }
 
-    let visible_chars = COMMAND_DISPLAY_MAX_CHARS.saturating_sub(3);
+    let visible_chars = max_chars.saturating_sub(3);
     let mut display = command.chars().take(visible_chars).collect::<String>();
     display.push_str("...");
     display
@@ -364,15 +414,147 @@ fn new_tab_button() -> gtk::Button {
         .build()
 }
 
-#[cfg(test)]
-mod tests {
-    use std::time::Duration;
+fn recent_blocks_button() -> gtk::Button {
+    gtk::Button::builder()
+        .icon_name("view-list-symbolic")
+        .tooltip_text("Recent Command Blocks")
+        .action_name("win.show-recent-blocks")
+        .build()
+}
 
-    use crate::terminal::{
-        CommandBlockId, CommandLifecycleState, TerminalSessionId, TerminalSessionSnapshot,
+fn recent_blocks_content(blocks: &[CommandBlock]) -> gtk::Widget {
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(12)
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
+
+    if blocks.is_empty() {
+        let empty_label = gtk::Label::builder()
+            .label("No command blocks yet.")
+            .xalign(0.0)
+            .build();
+        content.append(&empty_label);
+
+        return content.upcast();
+    }
+
+    let list = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .build();
+    list.add_css_class("boxed-list");
+
+    for block in blocks {
+        list.append(&recent_block_row(block));
+    }
+
+    let scrolled = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .hexpand(true)
+        .vexpand(true)
+        .child(&list)
+        .build();
+    content.append(&scrolled);
+
+    content.upcast()
+}
+
+fn recent_block_row(block: &CommandBlock) -> gtk::ListBoxRow {
+    let row = gtk::ListBoxRow::new();
+    let row_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(12)
+        .margin_top(8)
+        .margin_bottom(8)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
+
+    let label = gtk::Label::builder()
+        .label(format_command_block_row(block))
+        .xalign(0.0)
+        .hexpand(true)
+        .ellipsize(pango::EllipsizeMode::End)
+        .build();
+    row_box.append(&label);
+
+    if let Some(command) = command_text_for_copy(block) {
+        let copy_button = gtk::Button::builder()
+            .icon_name("edit-copy-symbolic")
+            .tooltip_text("Copy Command")
+            .valign(gtk::Align::Center)
+            .build();
+        let command = command.to_string();
+        copy_button.connect_clicked(move |_| copy_command_to_clipboard(&command));
+        row_box.append(&copy_button);
+    }
+
+    row.set_child(Some(&row_box));
+    row
+}
+
+fn format_command_block_row(block: &CommandBlock) -> String {
+    let mut parts = vec![format!("#{}", block.id.as_u64())];
+
+    if block.ended_at.is_some() {
+        parts.push(match block.exit_status {
+            Some(status) => format!("exit {status}"),
+            None => "exit ?".to_string(),
+        });
+
+        if let Some(duration) = block.duration() {
+            parts.push(format_duration(duration));
+        }
+    } else {
+        parts.push("running".to_string());
+    }
+
+    parts.push(command_block_command_for_display(block.command.as_deref()));
+
+    parts.join(" · ")
+}
+
+fn command_block_command_for_display(command: Option<&str>) -> String {
+    let command = command
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+        .unwrap_or("<unknown command>");
+
+    truncate_text_for_display(command, COMMAND_BLOCK_DISPLAY_MAX_CHARS)
+}
+
+fn command_text_for_copy(block: &CommandBlock) -> Option<&str> {
+    let command = block.command.as_deref()?;
+
+    if command.trim().is_empty() {
+        return None;
+    }
+
+    Some(command)
+}
+
+fn copy_command_to_clipboard(command: &str) {
+    let Some(display) = gdk::Display::default() else {
+        return;
     };
 
-    use super::{format_duration, format_session_title};
+    display.clipboard().set_text(command);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, UNIX_EPOCH};
+
+    use crate::terminal::{
+        CommandBlock, CommandBlockId, CommandLifecycleState, TerminalSessionId,
+        TerminalSessionSnapshot,
+    };
+
+    use super::{format_command_block_row, format_duration, format_session_title};
 
     fn snapshot(state: CommandLifecycleState) -> TerminalSessionSnapshot {
         TerminalSessionSnapshot {
@@ -384,6 +566,26 @@ mod tests {
             current_block_command: None,
             last_finished_block_duration: None,
             last_finished_block_command: None,
+        }
+    }
+
+    fn at_millis(millis: u64) -> std::time::SystemTime {
+        UNIX_EPOCH + Duration::from_millis(millis)
+    }
+
+    fn command_block(
+        id: u64,
+        command: Option<&str>,
+        ended_at: Option<std::time::SystemTime>,
+        exit_status: Option<i32>,
+    ) -> CommandBlock {
+        CommandBlock {
+            id: CommandBlockId::for_tests(id),
+            session_id: TerminalSessionId::for_tests(3),
+            command: command.map(str::to_string),
+            started_at: at_millis(1_000),
+            ended_at,
+            exit_status,
         }
     }
 
@@ -475,5 +677,59 @@ mod tests {
         assert_eq!(format_duration(Duration::from_millis(84)), "84ms");
         assert_eq!(format_duration(Duration::from_secs(1)), "1s");
         assert_eq!(format_duration(Duration::from_millis(1_500)), "1.5s");
+    }
+
+    #[test]
+    fn formats_successful_command_block_row() {
+        let block = command_block(12, Some("echo hello"), Some(at_millis(1_084)), Some(0));
+
+        assert_eq!(
+            format_command_block_row(&block),
+            "#12 · exit 0 · 84ms · echo hello"
+        );
+    }
+
+    #[test]
+    fn formats_failed_command_block_row() {
+        let block = command_block(13, Some("false"), Some(at_millis(1_042)), Some(1));
+
+        assert_eq!(
+            format_command_block_row(&block),
+            "#13 · exit 1 · 42ms · false"
+        );
+    }
+
+    #[test]
+    fn formats_running_command_block_row() {
+        let block = command_block(14, Some("sleep 10"), None, None);
+
+        assert_eq!(format_command_block_row(&block), "#14 · running · sleep 10");
+    }
+
+    #[test]
+    fn formats_missing_command_block_row() {
+        let block = command_block(15, None, Some(at_millis(1_010)), Some(0));
+
+        assert_eq!(
+            format_command_block_row(&block),
+            "#15 · exit 0 · 10ms · <unknown command>"
+        );
+    }
+
+    #[test]
+    fn truncates_long_command_block_row_command() {
+        let block = command_block(
+            16,
+            Some(
+                "printf 'this is a deliberately long command that keeps going past the row limit'",
+            ),
+            Some(at_millis(1_001)),
+            Some(0),
+        );
+
+        assert_eq!(
+            format_command_block_row(&block),
+            "#16 · exit 0 · 1ms · printf 'this is a deliberately long command that keeps going past the..."
+        );
     }
 }

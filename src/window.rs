@@ -68,6 +68,17 @@ fn install_window_actions(
     window.add_action(&new_tab_action);
     app.set_accels_for_action("win.new-tab", &["<Control><Shift>t"]);
 
+    let show_recent_blocks_action = gio::SimpleAction::new("show-recent-blocks", None);
+    show_recent_blocks_action.connect_activate({
+        let workspace = Rc::clone(workspace);
+        let window = window.clone();
+        move |_, _| {
+            workspace.show_recent_blocks(&window);
+        }
+    });
+    window.add_action(&show_recent_blocks_action);
+    app.set_accels_for_action("win.show-recent-blocks", &["<Control><Shift>b"]);
+
     let close_tab_action = gio::SimpleAction::new("close-tab", None);
     close_tab_action.connect_activate({
         let workspace = Rc::clone(workspace);
