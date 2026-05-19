@@ -1,5 +1,5 @@
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     env,
     fs::File,
     io::{self, BufRead, BufReader},
@@ -11,9 +11,14 @@ use std::{
 };
 
 use anyhow::{Context, anyhow};
+use futures_channel::mpsc::{self, UnboundedSender};
+use futures_util::StreamExt;
 use gtk::{gdk, prelude::*};
 use tessera::shell_integration::event::ShellSemanticEvent;
 use vte::prelude::*;
+
+use super::command_state::apply_semantic_event;
+use super::{CommandLifecycleState, TerminalSessionSnapshot};
 
 const ADWAITA_LIGHT_BACKGROUND: gdk::RGBA = gdk::RGBA::new(1.0, 1.0, 1.0, 1.0);
 const ADWAITA_LIGHT_FOREGROUND: gdk::RGBA = gdk::RGBA::new(0.0, 0.0, 6.0 / 255.0, 1.0);
@@ -65,6 +70,9 @@ pub struct TerminalSession {
     _theme_subscription: TerminalThemeSubscription,
     terminal: vte::Terminal,
     child_pid: Rc<Cell<Option<glib::Pid>>>,
+    command_state: Rc<RefCell<CommandLifecycleState>>,
+    last_exit_status: Rc<Cell<Option<i32>>>,
+    command_count: Rc<Cell<u64>>,
 }
 
 impl TerminalSession {
@@ -87,6 +95,9 @@ impl TerminalSession {
             _theme_subscription: theme_subscription,
             terminal,
             child_pid: Rc::new(Cell::new(None)),
+            command_state: Rc::new(RefCell::new(CommandLifecycleState::Idle)),
+            last_exit_status: Rc::new(Cell::new(None)),
+            command_count: Rc::new(Cell::new(0)),
         };
 
         session.install_child_exit_handler();
@@ -104,6 +115,15 @@ impl TerminalSession {
 
     pub fn widget(&self) -> &vte::Terminal {
         &self.terminal
+    }
+
+    #[allow(dead_code)]
+    pub fn snapshot(&self) -> TerminalSessionSnapshot {
+        TerminalSessionSnapshot {
+            state: *self.command_state.borrow(),
+            last_exit_status: self.last_exit_status.get(),
+            command_count: self.command_count.get(),
+        }
     }
 
     pub fn connect_exited<F>(&self, callback: F)
@@ -170,8 +190,9 @@ impl TerminalSession {
         let cwd = env::current_dir().context("could not determine working directory")?;
         let cwd = cwd.to_string_lossy().into_owned();
         let event_pipe = EventPipe::new().context("could not create proxy event pipe")?;
+        let event_sender = self.install_proxy_event_handler();
 
-        start_proxy_event_reader(self.id, event_pipe.read_fd)
+        start_proxy_event_reader(self.id, event_pipe.read_fd, event_sender)
             .context("could not start proxy event reader")?;
 
         let envv = proxy_child_environment(PROXY_EVENT_FD);
@@ -224,6 +245,37 @@ impl TerminalSession {
             child_pid.set(None);
             eprintln!("Terminal session {id:?} child exited with status {status}");
         });
+    }
+
+    fn install_proxy_event_handler(&self) -> UnboundedSender<ShellSemanticEvent> {
+        let (sender, mut receiver) = mpsc::unbounded();
+        let id = self.id;
+        let command_state = Rc::clone(&self.command_state);
+        let last_exit_status = Rc::clone(&self.last_exit_status);
+        let command_count = Rc::clone(&self.command_count);
+
+        glib::MainContext::default().spawn_local(async move {
+            while let Some(event) = receiver.next().await {
+                let mut snapshot = TerminalSessionSnapshot {
+                    state: *command_state.borrow(),
+                    last_exit_status: last_exit_status.get(),
+                    command_count: command_count.get(),
+                };
+
+                apply_semantic_event(&mut snapshot, &event);
+
+                *command_state.borrow_mut() = snapshot.state;
+                last_exit_status.set(snapshot.last_exit_status);
+                command_count.set(snapshot.command_count);
+
+                eprintln!(
+                    "Terminal session {id:?} semantic event: {event:?}, state: {:?}, command_count: {}",
+                    snapshot.state, snapshot.command_count
+                );
+            }
+        });
+
+        sender
     }
 }
 
@@ -347,16 +399,24 @@ impl EventPipe {
     }
 }
 
-fn start_proxy_event_reader(id: TerminalSessionId, read_fd: OwnedFd) -> io::Result<()> {
+fn start_proxy_event_reader(
+    id: TerminalSessionId,
+    read_fd: OwnedFd,
+    event_sender: UnboundedSender<ShellSemanticEvent>,
+) -> io::Result<()> {
     let thread_name = format!("tessera-proxy-events-{}", id.as_u64());
 
     thread::Builder::new()
         .name(thread_name)
-        .spawn(move || read_proxy_events(id, read_fd))
+        .spawn(move || read_proxy_events(id, read_fd, event_sender))
         .map(|_| ())
 }
 
-fn read_proxy_events(id: TerminalSessionId, read_fd: OwnedFd) {
+fn read_proxy_events(
+    id: TerminalSessionId,
+    read_fd: OwnedFd,
+    event_sender: UnboundedSender<ShellSemanticEvent>,
+) {
     let file = File::from(read_fd);
     let mut reader = BufReader::new(file);
 
@@ -372,7 +432,10 @@ fn read_proxy_events(id: TerminalSessionId, read_fd: OwnedFd) {
 
                 match serde_json::from_str::<ShellSemanticEvent>(&line) {
                     Ok(event) => {
-                        eprintln!("Terminal session {id:?} semantic event: {event:?}");
+                        if event_sender.unbounded_send(event).is_err() {
+                            eprintln!("Terminal session {id:?} semantic event receiver closed");
+                            break;
+                        }
                     }
                     Err(error) => {
                         eprintln!(

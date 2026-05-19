@@ -641,6 +641,8 @@ name = "tessera"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "futures-channel",
+ "futures-util",
  "gio",
  "glib",
  "gtk4",
