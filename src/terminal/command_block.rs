@@ -41,6 +41,30 @@ impl CommandBlock {
     pub fn has_output_metadata(&self) -> bool {
         !self.output_bytes.is_empty() || self.output_truncated
     }
+
+    pub fn captured_output_lossy_text(&self) -> String {
+        String::from_utf8_lossy(&self.output_bytes).into_owned()
+    }
+
+    pub fn to_markdown_with_output(&self) -> String {
+        let command = command_text_for_export(self).unwrap_or("<unknown command>");
+        let mut output = self.captured_output_lossy_text();
+
+        if self.output_truncated {
+            append_output_truncation_note(&mut output);
+        }
+
+        format!(
+            "## Command #{}\n\n- Status: `{}`\n- Duration: `{}`\n- Output: `{}`\n- Truncated: `{}`\n\n### Command\n\n{}\n\n### Output\n\n{}\n",
+            self.id.as_u64(),
+            command_block_exit_status_for_markdown(self),
+            command_block_duration_for_markdown(self),
+            format_command_block_output_size(self.output_bytes.len()),
+            self.output_truncated,
+            fenced_block("fish", command),
+            fenced_block("text", &output),
+        )
+    }
 }
 
 pub(crate) fn format_command_block_markdown(block: &CommandBlock) -> String {
@@ -109,6 +133,24 @@ pub(crate) fn format_command_blocks_markdown_table(blocks: &[CommandBlock]) -> S
                 command_block_command_for_table(block),
             ));
         }
+    }
+
+    markdown
+}
+
+pub(crate) fn format_command_blocks_markdown_with_output(blocks: &[CommandBlock]) -> String {
+    if blocks.is_empty() {
+        return "_No command blocks._\n".to_string();
+    }
+
+    let mut markdown = String::new();
+
+    for (index, block) in blocks.iter().enumerate() {
+        if index > 0 {
+            markdown.push('\n');
+        }
+
+        markdown.push_str(&block.to_markdown_with_output());
     }
 
     markdown
@@ -247,9 +289,28 @@ fn escape_markdown_table_cell(text: &str) -> String {
 }
 
 fn fenced_command_block(command: &str) -> String {
-    let fence = "`".repeat(longest_backtick_run(command).saturating_add(1).max(3));
+    fenced_block("sh", command)
+}
 
-    format!("{fence}sh\n{command}\n{fence}")
+fn fenced_block(language: &str, text: &str) -> String {
+    let fence = "`".repeat(longest_backtick_run(text).saturating_add(1).max(3));
+    let mut block = format!("{fence}{language}\n");
+    block.push_str(text);
+
+    if !text.is_empty() && !text.ends_with('\n') {
+        block.push('\n');
+    }
+
+    block.push_str(&fence);
+    block
+}
+
+fn append_output_truncation_note(output: &mut String) {
+    if !output.is_empty() && !output.ends_with('\n') {
+        output.push('\n');
+    }
+
+    output.push_str("[output truncated]");
 }
 
 fn longest_backtick_run(text: &str) -> usize {
@@ -689,6 +750,31 @@ mod tests {
     }
 
     #[test]
+    fn captured_output_lossy_text_preserves_text_and_line_breaks() {
+        let mut block = command_block(19, Some("printf hello"), Some(at_millis(1_084)), Some(0));
+        block.output_bytes = b"hello\nworld\n".to_vec();
+        let original_output = block.output_bytes.clone();
+
+        assert_eq!(block.captured_output_lossy_text(), "hello\nworld\n");
+        assert_eq!(block.output_bytes, original_output);
+    }
+
+    #[test]
+    fn captured_output_lossy_text_is_empty_for_empty_output() {
+        let block = command_block(20, Some("true"), Some(at_millis(1_084)), Some(0));
+
+        assert_eq!(block.captured_output_lossy_text(), "");
+    }
+
+    #[test]
+    fn captured_output_lossy_text_converts_non_utf8_lossily() {
+        let mut block = command_block(21, Some("printf bytes"), Some(at_millis(1_084)), Some(0));
+        block.output_bytes = vec![b'o', b'k', b' ', 0xff, 0xfe, b'\n'];
+
+        assert_eq!(block.captured_output_lossy_text(), "ok \u{fffd}\u{fffd}\n");
+    }
+
+    #[test]
     fn formats_successful_command_block_markdown() {
         let block = command_block(12, Some("echo hello"), Some(at_millis(1_084)), Some(0));
 
@@ -725,6 +811,81 @@ mod tests {
                 "```\n",
                 "- Output: 6 B\n",
                 "- Output truncated: no\n",
+            )
+        );
+    }
+
+    #[test]
+    fn formats_command_block_markdown_with_output_text() {
+        let mut block = command_block(22, Some("echo hello"), Some(at_millis(1_084)), Some(0));
+        block.output_bytes = b"hello\n".to_vec();
+
+        assert_eq!(
+            block.to_markdown_with_output(),
+            concat!(
+                "## Command #22\n\n",
+                "- Status: `0`\n",
+                "- Duration: `84ms`\n",
+                "- Output: `6 B`\n",
+                "- Truncated: `false`\n\n",
+                "### Command\n\n",
+                "```fish\n",
+                "echo hello\n",
+                "```\n\n",
+                "### Output\n\n",
+                "```text\n",
+                "hello\n",
+                "```\n"
+            )
+        );
+    }
+
+    #[test]
+    fn formats_command_block_markdown_with_truncated_output_text() {
+        let mut block = command_block(23, Some("yes"), Some(at_millis(1_084)), Some(141));
+        block.output_bytes = b"y".to_vec();
+        block.output_truncated = true;
+
+        assert_eq!(
+            block.to_markdown_with_output(),
+            concat!(
+                "## Command #23\n\n",
+                "- Status: `141`\n",
+                "- Duration: `84ms`\n",
+                "- Output: `1 B`\n",
+                "- Truncated: `true`\n\n",
+                "### Command\n\n",
+                "```fish\n",
+                "yes\n",
+                "```\n\n",
+                "### Output\n\n",
+                "```text\n",
+                "y\n",
+                "[output truncated]\n",
+                "```\n"
+            )
+        );
+    }
+
+    #[test]
+    fn formats_command_block_markdown_with_missing_output() {
+        let block = command_block(24, Some("true"), Some(at_millis(1_084)), Some(0));
+
+        assert_eq!(
+            block.to_markdown_with_output(),
+            concat!(
+                "## Command #24\n\n",
+                "- Status: `0`\n",
+                "- Duration: `84ms`\n",
+                "- Output: `0 B`\n",
+                "- Truncated: `false`\n\n",
+                "### Command\n\n",
+                "```fish\n",
+                "true\n",
+                "```\n\n",
+                "### Output\n\n",
+                "```text\n",
+                "```\n"
             )
         );
     }

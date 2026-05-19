@@ -11,7 +11,7 @@ use crate::terminal::{
     CommandBlock, CommandInputAvailability, CommandLifecycleState, TerminalSession,
     TerminalSessionId, TerminalSessionSnapshot, command_input_availability,
     format_command_block_duration, format_command_block_markdown, format_command_block_output_size,
-    format_command_blocks_markdown_table,
+    format_command_blocks_markdown_table, format_command_blocks_markdown_with_output,
 };
 
 const COMMAND_DISPLAY_MAX_CHARS: usize = 48;
@@ -443,6 +443,18 @@ fn recent_blocks_content(
     copy_recent_button.connect_clicked(move |_| copy_text_to_clipboard(&recent_markdown));
     content.append(&copy_recent_button);
 
+    if blocks.iter().any(CommandBlock::has_output_metadata) {
+        let copy_recent_with_output_button = gtk::Button::builder()
+            .label("Copy Recent Blocks Markdown + Output")
+            .tooltip_text("Copy Recent Blocks Markdown + Output")
+            .halign(gtk::Align::Start)
+            .build();
+        let recent_markdown = format_command_blocks_markdown_with_output(blocks);
+        copy_recent_with_output_button
+            .connect_clicked(move |_| copy_text_to_clipboard(&recent_markdown));
+        content.append(&copy_recent_with_output_button);
+    }
+
     let list = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::None)
         .build();
@@ -496,6 +508,28 @@ fn recent_block_row(
     copy_block_markdown_button.connect_clicked(move |_| copy_text_to_clipboard(&block_markdown));
     row_box.append(&copy_block_markdown_button);
 
+    if block.has_output_metadata() {
+        let copy_output_button = gtk::Button::builder()
+            .label("Copy Output")
+            .tooltip_text("Copy Output")
+            .sensitive(!block.output_bytes.is_empty())
+            .valign(gtk::Align::Center)
+            .build();
+        let output_text = captured_output_text_for_clipboard(block);
+        copy_output_button.connect_clicked(move |_| copy_text_to_clipboard(&output_text));
+        row_box.append(&copy_output_button);
+
+        let copy_command_output_button = gtk::Button::builder()
+            .label("Copy Command + Output")
+            .tooltip_text("Copy Command + Output Markdown")
+            .valign(gtk::Align::Center)
+            .build();
+        let command_output_markdown = block.to_markdown_with_output();
+        copy_command_output_button
+            .connect_clicked(move |_| copy_text_to_clipboard(&command_output_markdown));
+        row_box.append(&copy_command_output_button);
+    }
+
     if let Some(command) = command_text_for_actions(block) {
         let availability = command_input_availability(Some(command), state);
 
@@ -537,6 +571,20 @@ fn recent_block_row(
 
     row.set_child(Some(&row_box));
     row
+}
+
+fn captured_output_text_for_clipboard(block: &CommandBlock) -> String {
+    let mut output = block.captured_output_lossy_text();
+
+    if block.output_truncated {
+        if !output.is_empty() && !output.ends_with('\n') {
+            output.push('\n');
+        }
+
+        output.push_str("[output truncated]");
+    }
+
+    output
 }
 
 fn format_command_block_row(block: &CommandBlock) -> String {
