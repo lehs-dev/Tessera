@@ -19,6 +19,9 @@ use tessera::shell_integration::event::ShellSemanticEvent;
 use vte::prelude::*;
 
 use super::command_block::{finish_command_block, start_command_block};
+use super::command_input::{
+    can_accept_command_input_state, normalized_command_for_insert, normalized_command_for_run,
+};
 use super::command_state::{CommandStateSnapshot, apply_semantic_event};
 use super::{CommandBlock, CommandBlockId, CommandLifecycleState};
 
@@ -176,6 +179,43 @@ impl TerminalSession {
         let start = blocks.len().saturating_sub(limit);
 
         blocks[start..].to_vec()
+    }
+
+    pub fn can_accept_command_input(&self) -> bool {
+        can_accept_command_input_state(*self.command_state.borrow())
+    }
+
+    /// Sends command text to the terminal child without pressing Enter.
+    ///
+    /// Empty commands are ignored, line endings are normalized to LF, and input
+    /// is ignored while the session lifecycle is `Running`.
+    pub fn insert_command_text(&self, command: &str) {
+        if !self.can_accept_command_input() {
+            return;
+        }
+
+        let Some(command) = normalized_command_for_insert(command) else {
+            return;
+        };
+
+        self.terminal.feed_child(command.as_bytes());
+    }
+
+    /// Sends a single-line command to the terminal child followed by Enter.
+    ///
+    /// Empty and multiline commands are ignored. Multiline commands are
+    /// insert-only for now so the inspector cannot auto-run more than one line.
+    pub fn run_command_text(&self, command: &str) {
+        if !self.can_accept_command_input() {
+            return;
+        }
+
+        let Some(mut command) = normalized_command_for_run(command) else {
+            return;
+        };
+
+        command.push('\r');
+        self.terminal.feed_child(command.as_bytes());
     }
 
     #[allow(dead_code)]

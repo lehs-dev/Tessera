@@ -8,8 +8,8 @@ use glib::object::IsA;
 use gtk::{gdk, pango};
 
 use crate::terminal::{
-    CommandBlock, CommandLifecycleState, TerminalSession, TerminalSessionId,
-    TerminalSessionSnapshot,
+    CommandBlock, CommandInputAvailability, CommandLifecycleState, TerminalSession,
+    TerminalSessionId, TerminalSessionSnapshot, command_input_availability,
 };
 
 const COMMAND_DISPLAY_MAX_CHARS: usize = 48;
@@ -265,11 +265,11 @@ impl TerminalWorkspace {
             .title_widget(&title)
             .build();
 
+        let state = session.snapshot().state;
+        let blocks = session.recent_blocks(RECENT_COMMAND_BLOCK_LIMIT);
         let toolbar_view = adw::ToolbarView::new();
         toolbar_view.add_top_bar(&header_bar);
-        toolbar_view.set_content(Some(&recent_blocks_content(
-            &session.recent_blocks(RECENT_COMMAND_BLOCK_LIMIT),
-        )));
+        toolbar_view.set_content(Some(&recent_blocks_content(&session, state, &blocks)));
 
         window.set_child(Some(&toolbar_view));
         window.present();
@@ -422,7 +422,11 @@ fn recent_blocks_button() -> gtk::Button {
         .build()
 }
 
-fn recent_blocks_content(blocks: &[CommandBlock]) -> gtk::Widget {
+fn recent_blocks_content(
+    session: &Rc<TerminalSession>,
+    state: CommandLifecycleState,
+    blocks: &[CommandBlock],
+) -> gtk::Widget {
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(12)
@@ -448,7 +452,7 @@ fn recent_blocks_content(blocks: &[CommandBlock]) -> gtk::Widget {
     list.add_css_class("boxed-list");
 
     for block in blocks {
-        list.append(&recent_block_row(block));
+        list.append(&recent_block_row(session, state, block));
     }
 
     let scrolled = gtk::ScrolledWindow::builder()
@@ -463,7 +467,11 @@ fn recent_blocks_content(blocks: &[CommandBlock]) -> gtk::Widget {
     content.upcast()
 }
 
-fn recent_block_row(block: &CommandBlock) -> gtk::ListBoxRow {
+fn recent_block_row(
+    session: &Rc<TerminalSession>,
+    state: CommandLifecycleState,
+    block: &CommandBlock,
+) -> gtk::ListBoxRow {
     let row = gtk::ListBoxRow::new();
     let row_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -482,15 +490,43 @@ fn recent_block_row(block: &CommandBlock) -> gtk::ListBoxRow {
         .build();
     row_box.append(&label);
 
-    if let Some(command) = command_text_for_copy(block) {
+    if let Some(command) = command_text_for_actions(block) {
+        let availability = command_input_availability(Some(command), state);
+
         let copy_button = gtk::Button::builder()
-            .icon_name("edit-copy-symbolic")
+            .label("Copy")
             .tooltip_text("Copy Command")
             .valign(gtk::Align::Center)
             .build();
         let command = command.to_string();
-        copy_button.connect_clicked(move |_| copy_command_to_clipboard(&command));
+        let copy_command = command.clone();
+        copy_button.connect_clicked(move |_| copy_command_to_clipboard(&copy_command));
         row_box.append(&copy_button);
+
+        let insert_button = gtk::Button::builder()
+            .label("Insert")
+            .tooltip_text(command_insert_tooltip(availability))
+            .sensitive(availability.can_insert)
+            .valign(gtk::Align::Center)
+            .build();
+        let insert_session = Rc::clone(session);
+        let insert_command = command.clone();
+        insert_button.connect_clicked(move |_| {
+            insert_session.insert_command_text(&insert_command);
+        });
+        row_box.append(&insert_button);
+
+        let run_button = gtk::Button::builder()
+            .label("Run")
+            .tooltip_text(command_run_tooltip(availability, &command))
+            .sensitive(availability.can_run)
+            .valign(gtk::Align::Center)
+            .build();
+        let run_session = Rc::clone(session);
+        run_button.connect_clicked(move |_| {
+            run_session.run_command_text(&command);
+        });
+        row_box.append(&run_button);
     }
 
     row.set_child(Some(&row_box));
@@ -527,7 +563,7 @@ fn command_block_command_for_display(command: Option<&str>) -> String {
     truncate_text_for_display(command, COMMAND_BLOCK_DISPLAY_MAX_CHARS)
 }
 
-fn command_text_for_copy(block: &CommandBlock) -> Option<&str> {
+fn command_text_for_actions(block: &CommandBlock) -> Option<&str> {
     let command = block.command.as_deref()?;
 
     if command.trim().is_empty() {
@@ -535,6 +571,26 @@ fn command_text_for_copy(block: &CommandBlock) -> Option<&str> {
     }
 
     Some(command)
+}
+
+fn command_insert_tooltip(availability: CommandInputAvailability) -> &'static str {
+    if availability.can_insert {
+        return "Insert Command";
+    }
+
+    "Command input is disabled while the session is running"
+}
+
+fn command_run_tooltip(availability: CommandInputAvailability, command: &str) -> &'static str {
+    if availability.can_run {
+        return "Run Command";
+    }
+
+    if command.contains('\n') || command.contains('\r') {
+        return "Multiline commands can be inserted but not run yet";
+    }
+
+    "Command input is disabled while the session is running"
 }
 
 fn copy_command_to_clipboard(command: &str) {
